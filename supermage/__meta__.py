@@ -7,6 +7,6 @@ path = name.lower().replace("-", "_").replace(" ", "_")
 version = "0.2.0"
 author = "Michael James Yantovski Barth"
 author_email = "mjb299@pitt.edu"
-description = "Visibility-space gridder for image cubes"  # One-liner
+description = "A gas dynamics simulator for galaxies, and so much more."  # One-liner
 url = ""  # your project homepage
 license = "Unlicense"  # See https://choosealicense.com
