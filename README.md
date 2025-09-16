@@ -3,7 +3,6 @@
   <source media="(prefers-color-scheme: light)" srcset="https://github.com/mjyb16/supermage/blob/main/SuperMAGE%20logo_text.svg" width="70%" height="70%">
   <img alt="SuperMAGE logo" src="https://github.com/mjyb16/supermage/blob/main/SuperMAGE%20logo_text.svg" width="70%">
 </picture>
-
 # supermage
 SuperMAGE: **Super**massive black hole **ma**sses from **g**as kin**e**matics
 
