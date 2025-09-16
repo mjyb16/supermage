@@ -1,0 +1,16 @@
+astropy
+caskade
+caustics
+graphviz
+numpy
+safetensors
+scipy
+torch
+viscube
+
+ipywidgets
+jupyter-book
+matplotlib
+sphinx
+sphinx_rtd_theme
+sphinx-automodapi
