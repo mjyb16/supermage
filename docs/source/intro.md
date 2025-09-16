@@ -1,0 +1,3 @@
+# SuperMAGE
+
+Documentation coming soon!
