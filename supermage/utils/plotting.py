@@ -8,7 +8,6 @@ from typing import Tuple, Union
 
 def dirty_cube_tool(vis_bin_re_cube, vis_bin_imag_cube, roi_start, roi_end):
     # Define the region of interest for the cube (pixels 1000 to 1050)
-    roi_start, roi_end = 225, 276
     num_frequencies = vis_bin_re_cube.shape[0]  # Total number of frequencies
     
     # Initialize an empty list to store the dirty images
@@ -23,12 +22,55 @@ def dirty_cube_tool(vis_bin_re_cube, vis_bin_imag_cube, roi_start, roi_end):
         dirty_image = np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(combined_vis), norm = "backward"))
         
         # Take the real part (intensity map) and restrict to the region of interest
-        dirty_image_roi = np.abs(dirty_image)[roi_start:roi_end, roi_start:roi_end]
+        #dirty_image_roi = np.abs(dirty_image)[roi_start:roi_end, roi_start:roi_end]
+        dirty_image_roi = (dirty_image.real)[roi_start:roi_end, roi_start:roi_end]
         
         # Append the region of interest for this frequency to the dirty cube
         dirty_cube.append(dirty_image_roi)
     
     # Stack all frequency slices to form a 3D array (dirty cube)
+    dirty_cube = np.stack(dirty_cube, axis=-1)
+    return dirty_cube
+
+def weighted_dirty_cube_tool(
+    vis_bin_re_cube, vis_bin_imag_cube,
+    roi_start, roi_end,
+    std_grid_cube_real=None,
+    std_grid_cube_imag=None,
+    fft_norm="backward",        # unitary FFT keeps noise scaling tidy
+    return_snr=False
+):
+    """
+    Build dirty (and optionally SNR) cube from per-cell *means* by
+    reweighting with a weight grid (Σw or counts), enforcing Hermitian symmetry,
+    and using the real part (no Ricean bias).
+    """
+    F, Nu, Nv = vis_bin_re_cube.shape
+    dirty_cube = []
+
+    # Choose a weight grid; 1s if none provided
+    has_weights = std_grid_cube_real is not None
+    if not has_weights:
+        std_grid_cube_real = np.ones_like(vis_bin_re_cube)
+    has_weights = std_grid_cube_imag is not None
+    if not has_weights:
+        std_grid_cube_imag = np.ones_like(vis_bin_re_cube)
+
+    std_averaged = np.nan_to_num(np.mean((std_grid_cube_real, std_grid_cube_imag), axis = 0), nan = 0, posinf = 0, neginf = 0)
+    std_averaged[np.abs(std_averaged) < 1e-10] = 1e10
+    weight_grid_cube = 1/(std_averaged**2)
+
+    for i in range(F):
+        # recover "sum" grid from mean grid by multiplying weights
+        sum_grid = (vis_bin_re_cube[i] + 1j * vis_bin_imag_cube[i]) * weight_grid_cube[i]
+
+        # inverse FFT to image plane
+        img = np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(sum_grid), norm=fft_norm)).real
+
+        # crop ROI
+        img_roi = img[roi_start:roi_end, roi_start:roi_end]
+        dirty_cube.append(img_roi)
+
     dirty_cube = np.stack(dirty_cube, axis=-1)
     return dirty_cube
 
