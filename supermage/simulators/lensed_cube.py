@@ -104,7 +104,7 @@ class AnalyticLens(Module):
         chunk_v: int | None = None,# optional: process velocity axis in chunks of this many hi-res planes
         device: str = "cuda",
         dtype : torch.dtype = torch.float32,
-        line  : str = "co21",
+        line  : 230.538,
         name  : str = "analytic_cloudless_lens_inverse",
     ):
         super().__init__(name)
