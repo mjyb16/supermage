@@ -170,7 +170,7 @@ class CloudRasterizerOversample(Module):
                  oversamp_v : int = 4,   # NEW: velocity oversampling
                  device: str = "cuda",
                  dtype : torch.dtype = torch.float32,
-                 line = "co21",
+                 line = 230.538,
                  name  : str = "raster"):
         super().__init__()
         self.device, self.dtype = device, dtype
