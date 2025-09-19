@@ -7,7 +7,7 @@ def create_velocity_grid_stable(
     num_points: int,
     target_dtype = torch.float32,
     device = "cpu",
-    line = "co21"
+    line = 230.538
 ):
     """
     Creates a velocity grid using a numerically stable approach.
@@ -31,7 +31,7 @@ def create_velocity_grid_stable(
     # becomes a uniform velocity grid (v_i = v_start + i*delta_v).
     
     # Calculate v_start = v(f_start_64)
-    v_start_64 = freq_to_vel_absolute(f_start_64, line = line)
+    v_start_64 = freq_to_vel_absolute(f_start_64, rest_frame_freq = line)
     
     # Calculate delta_v = v(f_start_64 + df_64) - v(f_start_64)
     v_after_step_64 = freq_to_vel_absolute(f_start_64 + df_64, line = line)
@@ -50,16 +50,12 @@ def create_velocity_grid_stable(
 
     return abs_velocities.to(device = device), velocity_steps.to(device = device)
 
-def freq_to_vel_absolute(freq, line, dtype = torch.float64):
+def freq_to_vel_absolute(freq, rest_frame_freq, dtype = torch.float64):
     """
     Converts frequency (GHz) to absolute velocity (km/s) using the radio convention.
     """
     # Use high precision for constants 
     c_kms = torch.tensor(const.c.value / 1e3, dtype=dtype, device=freq.device)
-    if line == "co21":
-        co21_rest_freq_ghz = torch.tensor(230.538, dtype=dtype, device=freq.device)
-    
-        velocities = c_kms * (co21_rest_freq_ghz - freq) / co21_rest_freq_ghz
-    else:
-        print("ERROR: Line not implemented")
+    rest_freq_ghz = torch.tensor(rest_frame_freq, dtype=dtype, device=freq.device)
+    velocities = c_kms * (rest_freq_ghz - freq) / rest_freq_ghz
     return velocities
