@@ -67,13 +67,12 @@ class VisibilityCubePadded(Module):
 
     # ---------------------------------------------------------------------
     @forward
-    def forward(self, plot = True, flux = None):
+    def forward(self, flux = None):
         """
         If `plot` is True → full UV cube masked by `mask`.
         If `plot` is False → only values where mask == True.
         """
         cube_small = self.cube_simulator.forward()          # (N_chan, S, S)
-
         # 1. multiply by primary beam on the same small grid
         cube_pb = cube_small * self.pb_small                # (N_chan, S, S)
         del cube_small
@@ -81,7 +80,7 @@ class VisibilityCubePadded(Module):
         # 2. scale to requested total flux *before* padding
         if flux is None:
             flux = self.flux if self.flux is not None else 1.0
-        cube_pb = cube_pb * flux / self.dv / cube_pb.sum() #Integrated flux in Jy km/s
+        cube_pb = cube_pb * flux / torch.abs(self.dv) / cube_pb.sum() #Integrated flux in Jy km/s
 
         # 3. pad *both* spatial axes to (npix, npix)
         cube_pad = F.pad(cube_pb, self.pad, mode="constant", value=0.0)
@@ -95,10 +94,5 @@ class VisibilityCubePadded(Module):
         )
         del cube_pad                                           # memory
 
-        # 5. deliver either the full UV plane or only the sampled points
-        if plot:
-            return fft_cube * self.mask.float()                # (N_chan, npix, npix)
-
-        def gather(fft_slc, mask_slc):                         # per‑channel
-            return fft_slc[mask_slc]
-        return torch.vmap(gather)(fft_cube, self.mask)         # (N_chan, N_points)
+        # 5. deliver the full UV plane
+        return fft_cube * self.mask.float()                # (N_chan, npix, npix)
