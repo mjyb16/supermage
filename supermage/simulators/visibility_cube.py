@@ -16,7 +16,7 @@ class VisibilityCubePadded(Module):
         npix,                 # final grid side
         pixelscale,           # ″ / pix on the final grid
         dish_diameter: float = 12.0,
-        line = "co21"
+        line = 230.538
     ):
         super().__init__()
         self.cube_simulator = cube_simulator
