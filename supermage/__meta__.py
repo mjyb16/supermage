@@ -4,7 +4,7 @@ name = "supermage"
 path = name.lower().replace("-", "_").replace(" ", "_")
 # Your version number should follow https://python.org/dev/peps/pep-0440 and
 # https://semver.org
-version = "0.3.2"
+version = "0.3.3"
 author = "Michael James Yantovski Barth"
 author_email = "mjb299@pitt.edu"
 description = "A gas dynamics simulator for galaxies, and so much more."  # One-liner
