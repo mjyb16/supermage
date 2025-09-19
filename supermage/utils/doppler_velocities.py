@@ -34,7 +34,7 @@ def create_velocity_grid_stable(
     v_start_64 = freq_to_vel_absolute(f_start_64, rest_frame_freq = line)
     
     # Calculate delta_v = v(f_start_64 + df_64) - v(f_start_64)
-    v_after_step_64 = freq_to_vel_absolute(f_start_64 + df_64, line = line)
+    v_after_step_64 = freq_to_vel_absolute(f_start_64 + df_64, rest_frame_freq = line)
     delta_v_64 = v_after_step_64 - v_start_64
     
     # --- Step 3: Construct the final grid using the TARGET PRECISION (float32) ---
