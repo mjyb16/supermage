@@ -293,9 +293,12 @@ class GasSelfGrav(Module):
         return torch.sqrt(vcsqr)
 
 class Nuker_Gas(Module):
-    def __init__(self, intensity_model, N_MGE_components: int, Nuker_NN, NN_dtype, distance, r_min, r_max, soft, device, dtype, quad_points=128):
+    def __init__(self, gas_grav_model, N_MGE_components: int, Nuker_NN, NN_dtype, distance, r_min, r_max, soft, device, dtype, quad_points=128):
         super().__init__("Nuker_Gas")
-        self.scale = intensity_model.scale
+        self.gas_grav = gas_grav_model
+        self.scale = gas_grav_model.scale
+        self.m_gas = gas_grav_model.m_gas
+        
         self.N_components = N_MGE_components
         self.soft = soft
         self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
@@ -318,7 +321,6 @@ class Nuker_Gas(Module):
         
         self.sigma = (distance_t * (pi_t / 0.648)) * 10**(low_Gauss + (0.5 + torch.arange(self.N_components, device=device, dtype=dtype)) * dx)
 
-        self.m_gas = Param("m_gas",  shape=())
         self.inc   = Param("inc",   shape=())
         self.qintr = Param("qintr", shape=())
         self.qintr_shaper = torch.ones((self.N_components), device = device).to(dtype = dtype)
@@ -361,9 +363,7 @@ class Nuker_Gas(Module):
         MGE_sigma = self.sigma*r_b
         v_stars_BH = self.MGE.velocity(R_map = R_flat, surf = surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
 
-        x=R_flat/scale
-        prefac=((G*(10**m_gas))/(2*scale))*(x**2)
-        endfac=modified_bessel_i0(x/2)*modified_bessel_k0(x/2) - modified_bessel_i1(x/2)*modified_bessel_k1(x/2)
-        v_gas = torch.sqrt(prefac*endfac)
+        v_gas = self.gas_grav.velocity(R_flat, m_gas = m_gas, scale = scale)
+
         v_rot = torch.sqrt(v_stars_BH**2 + v_gas**2) 
         return v_rot
