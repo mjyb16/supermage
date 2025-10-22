@@ -124,7 +124,7 @@ class AnalyticLens(Module):
         self.distance_pc     = Param("distance_pc",     None)     # [pc], for arcsec↔pc conversion
 
         # Velocity grid (low & high)
-        from supermage.utils.cube_tools import create_velocity_grid_stable
+        from supermage.utils.doppler_velocities import create_velocity_grid_stable
         vel_axis, _ = create_velocity_grid_stable(
             f_start=freq_axis[0], f_end=freq_axis[-1],
             num_points=len(freq_axis), target_dtype=dtype, line=line
