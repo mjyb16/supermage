@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from torch import pi, sqrt
 from torch.special import modified_bessel_i0, modified_bessel_i1, modified_bessel_k0, modified_bessel_k1
 from caskade import Module, forward, Param
@@ -7,7 +8,7 @@ from numpy.polynomial.legendre import leggauss
 from torch.nn.functional import conv2d, avg_pool2d
 from functools import lru_cache
 import math
-
+import joblib
 
 @lru_cache(maxsize=None)
 def _leggauss_const(n, dtype, device):
@@ -277,6 +278,7 @@ class Nuker_MGE(Module):
         v_rot = self.MGE.velocity(R_map = R_flat, surf = surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
         return v_rot
 
+<<<<<<< HEAD
 class GasSelfGrav(Module):
     def __init__(self,intensity_model,device,dtype):
         super().__init__("GasSelfGrav")
@@ -301,12 +303,43 @@ class Nuker_Gas(Module):
         
         self.N_components = N_MGE_components
         self.soft = soft
+=======
+class NukerMGEFull(Module):
+    def __init__(self, N_MGE_components: int, Nuker_NN, NN_dtype, distance, soft, device, dtype, scaler_path, quad_points=128):
+        """
+        A velocity model that uses a trained neural network to map Nuker
+        parameters to an MGE representation.
+
+        Args:
+            trained_nn_model (MGEProfileModel): The fully trained neural network model
+                that predicts MGE profiles.
+            scaler_path (str): The file path to the saved 'StandardScaler'
+                (.joblib file) used during training.
+            device: The PyTorch device (e.g., 'cuda' or 'cpu').
+            dtype: The PyTorch data type (e.g., torch.float32).
+            mge_velocity_calculator (MGEVelocityIntr): A pre-initialized module
+                that calculates velocities from MGE components.
+        """
+        super().__init__("NukerMGEFull")
+
+        self.N_components = N_MGE_components
+        self.soft = soft
+        # pc / arcsec conversion (distance in Mpc)
+        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
+        c_t    = torch.tensor(0.648, device=device, dtype=dtype)  # so that pi/0.648 ≈ 4.848
+        self.distance_Mpc   = torch.tensor(distance, device=device, dtype=dtype)
+        self.pc_per_arcsec  = self.distance_Mpc * (pi_t / c_t)    # ≈ 4.848 * D_Mpc
+        # Small epsilon for safe logs
+        self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
+        
+>>>>>>> 80725c7 (Adding new nuker model)
         self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
         self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
         self.NN = Nuker_NN
+<<<<<<< HEAD
 
         inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
         outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
@@ -341,10 +374,130 @@ class Nuker_Gas(Module):
         # Create tensor constants that match the input tensor's properties
         linthresh_t = torch.tensor(linthresh, device=y.device, dtype=y.dtype)
         base_t = torch.tensor(base, device=y.device, dtype=y.dtype)
+=======
+        
+        # --- 2. Load the Scaler and create autodifferentiable buffers ---
+        try:
+            scaler = joblib.load(scaler_path)
+            # Convert scaler's mean and scale to PyTorch tensors
+            self.scaler_mean = torch.tensor(scaler.mean_, device=device, dtype=dtype)
+            self.scaler_scale = torch.tensor(scaler.scale_, device=device, dtype=dtype)
+            
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"Scaler file not found at '{scaler_path}'. "
+                "This file is required to transform inputs for the neural network."
+            )
+        
+        # --- 4. Define the fittable parameters using Caskade's syntax ---
+        # These are the physical parameters of the galaxy model
+        self.inc   = Param("inc",   shape=())
+        self.qintr = Param("qintr", shape=())
+        self.m_bh  = Param("m_bh",  shape=())
+        
+        # These are the four Nuker parameters that will be fed into the NN
+        self.alpha   = Param("alpha",   shape=(1, ))
+        self.gmb = Param("gamma_minus_beta", shape=(1, ))
+        self.gamma   = Param("gamma",   shape=(1, ))
+        self.r_b = Param("r_b", shape=(1, ))
+        self.I_b = Param("intensity_r_b", shape = ())
+
+        # --- 5. Set up other necessary attributes ---
+        # Get the number of components from the trained NN model
+        self.N_components = self.NN.n_gauss_model
+        self.qintr_shaper = torch.ones((self.N_components), device=device, dtype=dtype)
+        
+        # Link parameters to the MGE velocity calculator
+        self.MGE.inc = self.inc
+        self.MGE.m_bh = self.m_bh
+
+    @forward
+    def velocity(self, R_flat,
+                 inc=None, qintr=None, m_bh=None,
+                 alpha = None, gmb = None, gamma = None, r_b = None, I_b = None,
+                 G=0.004301):
+        """
+        Calculates the velocity curve.
+        """
+        # --- Step 1: Assemble the Nuker parameters for the NN ---
+        # The NN expects a tensor of shape (batch_size, 4).
+        # We unsqueeze to create a batch dimension of 1.
+        beta = gamma - gmb
+        r_b_pc = torch.clamp(r_b * self.pc_per_arcsec, min=self._eps)
+        log10_r_b_pc = torch.log10(r_b_pc)
+        NN_input = torch.cat([
+            alpha,
+            beta,
+            gamma,
+            log10_r_b_pc
+        ]).unsqueeze(0) # Transpose to get shape (1, 4)
+
+        # --- Step 2: Apply the scaler transformation (autodifferentiable) ---
+        # This operation is now part of the PyTorch computation graph.
+        NN_input_scaled = (NN_input - self.scaler_mean) / self.scaler_scale
+
+        # --- Step 3: Get MGE parameters from the trained neural network ---
+        # The NN_model's internal get_mge_params handles the symexp transform.
+        # It returns surf and sigma with shape (1, n_gauss). We squeeze them.
+        surf, sigma = self.NN.get_mge_params(NN_input_scaled)
+        surf = surf.squeeze(0)
+        sigma = sigma.squeeze(0)
+        
+        # --- Step 4: Calculate the velocity using the predicted MGE ---
+        v_rot = self.MGE.velocity(
+            R_map=R_flat, 
+            surf=surf*10**I_b, 
+            sigma=sigma, 
+            qintr=qintr * self.qintr_shaper
+        )
+        
+        return v_rot
+
+class NukerMGEProfileModel(nn.Module):
+    """
+    A model that predicts the MGE mass profile from Nuker parameters.
+    
+    This version now uses a symexp transformation as a final activation function
+    to decompress the network's output into the high-dynamic-range MGE surf values.
+    """
+    def __init__(self, n_gauss_model, n_radii_data=100, r_min=1, r_max=10000, 
+                 linthresh=1e-5, base=10.0): # <--- NEW: Hyperparameters for symexp
+        """
+        Initializes the model and the fixed sigma grid.
+        Args:
+            n_gauss_model (int): The number of Gaussian components.
+            n_radii_data (int): The number of radial bins for the profile.
+            r_min (float): The minimum radius (in pc) for the sigma grid calculation.
+            r_max (float): The maximum radius (in pc) for the sigma grid calculation.
+            linthresh (float): The threshold for the linear region of symexp/symlog.
+            base (float): The base for the exponential/logarithmic part of the transform.
+        """
+        super(NukerMGEProfileModel, self).__init__()
+        self.n_gauss_model = n_gauss_model
+        self.nuker_to_mge_net = NukerToMGE_NN(n_gauss=self.n_gauss_model)
+        
+        # Store symexp parameters
+        self.linthresh = linthresh # <--- NEW
+        self.base = base         # <--- NEW
+
+        r_space_basis = np.geomspace(r_min, r_max, n_radii_data)
+        low_Gauss = np.log10(np.min(r_space_basis) / np.sqrt(3.0))
+        high_Gauss = np.log10(np.max(r_space_basis) / np.sqrt(3.0))
+        dx = (high_Gauss - low_Gauss) / self.n_gauss_model
+        sigma_grid_np = 10**(low_Gauss + (0.5 + np.arange(self.n_gauss_model)) * dx)
+        
+        self.register_buffer('sigma_grid', torch.tensor(sigma_grid_np, dtype=torch.float32))
+
+    def symexp(self, y): # <--- NEW: Symexp transformation method
+        """ Symmetrical exponential function. Inverse of symlog. """
+        linthresh_t = torch.tensor(self.linthresh, device=y.device, dtype=y.dtype)
+        base_t = torch.tensor(self.base, device=y.device, dtype=y.dtype)
+>>>>>>> 80725c7 (Adding new nuker model)
         one_t = torch.tensor(1.0, device=y.device, dtype=y.dtype)
     
         return torch.sign(y) * linthresh_t * (base_t**torch.abs(y) - one_t)
 
+<<<<<<< HEAD
     @forward
     def velocity(self, R_flat,
                  m_gas = None, scale = None, 
@@ -367,3 +520,80 @@ class Nuker_Gas(Module):
 
         v_rot = torch.sqrt(v_stars_BH**2 + v_gas**2) 
         return v_rot
+=======
+    def symlog(self, x): # <--- NEW: Symlog for analysis (not used in training)
+        """ Symmetrical logarithmic function. Inverse of symexp. """
+        linthresh_t = torch.tensor(self.linthresh, device=x.device, dtype=x.dtype)
+        base_t = torch.tensor(self.base, device=x.device, dtype=x.dtype)
+        one_t = torch.tensor(1.0, device=x.device, dtype=x.dtype)
+
+        return torch.sign(x) * torch.log10(torch.abs(x) / linthresh_t + one_t)
+
+    def get_mge_params(self, nuker_params):
+        """
+        Exposes the MGE parameters after applying the symexp transform.
+        """
+        # The core NN now predicts the *compressed* surf values
+        compressed_surfs = self.nuker_to_mge_net(nuker_params) # <--- CHANGED
+        
+        # Apply the symexp transform to get the true, high-dynamic-range surf values
+        predicted_surfs = self.symexp(compressed_surfs) # <--- CHANGED
+        
+        return predicted_surfs, self.sigma_grid
+
+    def forward(self, nuker_params, r_space_eval):
+        """
+        Predicts the MGE mass profile. This function does not need to change.
+        """
+        # This method automatically uses the new get_mge_params method
+        predicted_surfs, sigmas = self.get_mge_params(nuker_params)
+        
+        r_squared = r_space_eval.view(1, 1, -1)**2
+        sigmas_squared = (2 * sigmas.view(1, -1, 1)**2)
+        
+        gaussians = torch.exp(-r_squared / sigmas_squared)
+        mass_profile = torch.sum(predicted_surfs.unsqueeze(2) * gaussians, dim=1)
+        return mass_profile
+
+class NukerToMGE_NN(nn.Module):
+    """
+    A neural network that maps Nuker parameters to MGE surface brightness normalizations.
+    """
+    def __init__(self, n_gauss=64):
+        """
+        Initializes the network architecture.
+        Args:
+            n_gauss (int): The number of Gaussian components in the MGE model.
+        """
+        super(NukerToMGE_NN, self).__init__()
+        
+        # This sequential model forms the core of the network, learning the
+        # complex relationship between Nuker parameters and MGE normalizations.
+        self.layers = nn.Sequential(
+            # Input layer expects 4 features: alpha, beta, gamma, log_r_b
+            nn.Linear(4, 128),
+            nn.SELU(),
+            nn.Linear(128, 256),
+            nn.SELU(),
+            nn.Linear(256, 512),
+            nn.SELU(),
+            nn.Linear(512, 256),
+            nn.SELU(),
+            nn.Linear(256, 128),
+            nn.SELU(),
+            # Output layer produces n_gauss values, corresponding to the MGE surfs.
+            nn.Linear(128, n_gauss)
+        )
+
+    def forward(self, x):
+        """
+        Performs the forward pass.
+        Args:
+            x (torch.Tensor): A tensor of shape (batch_size, 4) containing the
+                              Nuker parameters.
+        Returns:
+            torch.Tensor: A tensor of shape (batch_size, n_gauss) representing
+                          the predicted MGE surf values.
+        """
+        return self.layers(x)
+>>>>>>> 80725c7 (Adding new nuker model)
