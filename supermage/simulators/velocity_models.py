@@ -278,7 +278,6 @@ class Nuker_MGE(Module):
         v_rot = self.MGE.velocity(R_map = R_flat, surf = surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
         return v_rot
 
-<<<<<<< HEAD
 class GasSelfGrav(Module):
     def __init__(self,intensity_model,device,dtype):
         super().__init__("GasSelfGrav")
@@ -303,43 +302,12 @@ class Nuker_Gas(Module):
         
         self.N_components = N_MGE_components
         self.soft = soft
-=======
-class NukerMGEFull(Module):
-    def __init__(self, N_MGE_components: int, Nuker_NN, NN_dtype, distance, soft, device, dtype, scaler_path, quad_points=128):
-        """
-        A velocity model that uses a trained neural network to map Nuker
-        parameters to an MGE representation.
-
-        Args:
-            trained_nn_model (MGEProfileModel): The fully trained neural network model
-                that predicts MGE profiles.
-            scaler_path (str): The file path to the saved 'StandardScaler'
-                (.joblib file) used during training.
-            device: The PyTorch device (e.g., 'cuda' or 'cpu').
-            dtype: The PyTorch data type (e.g., torch.float32).
-            mge_velocity_calculator (MGEVelocityIntr): A pre-initialized module
-                that calculates velocities from MGE components.
-        """
-        super().__init__("NukerMGEFull")
-
-        self.N_components = N_MGE_components
-        self.soft = soft
-        # pc / arcsec conversion (distance in Mpc)
-        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
-        c_t    = torch.tensor(0.648, device=device, dtype=dtype)  # so that pi/0.648 ≈ 4.848
-        self.distance_Mpc   = torch.tensor(distance, device=device, dtype=dtype)
-        self.pc_per_arcsec  = self.distance_Mpc * (pi_t / c_t)    # ≈ 4.848 * D_Mpc
-        # Small epsilon for safe logs
-        self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
-        
->>>>>>> 80725c7 (Adding new nuker model)
         self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
         self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
         self.NN = Nuker_NN
-<<<<<<< HEAD
 
         inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
         outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
@@ -374,7 +342,68 @@ class NukerMGEFull(Module):
         # Create tensor constants that match the input tensor's properties
         linthresh_t = torch.tensor(linthresh, device=y.device, dtype=y.dtype)
         base_t = torch.tensor(base, device=y.device, dtype=y.dtype)
-=======
+        one_t = torch.tensor(1.0, device=y.device, dtype=y.dtype)
+    
+        return torch.sign(y) * linthresh_t * (base_t**torch.abs(y) - one_t)
+
+    @forward
+    def velocity(self, R_flat,
+                 m_gas = None, scale = None, 
+                 inc=None, qintr=None, m_bh=None,
+                 alpha = None, gmb = None, gamma = None, r_b = None, I_b = None,
+                 G=0.004301):
+        device = R_flat.device
+        dtype  = R_flat.dtype
+        beta = gamma - gmb
+
+        NN_input = torch.cat([alpha, beta, gamma])#.to(self.NN_dtype)
+        NN_output_transformed = self.NN.forward(NN_input)#.to(self.dtype)
+        NN_output = self.symexp(NN_output_transformed)
+        
+        surf = NN_output*10**I_b
+        MGE_sigma = self.sigma*r_b
+        v_stars_BH = self.MGE.velocity(R_map = R_flat, surf = surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
+
+        v_gas = self.gas_grav.velocity(R_flat, m_gas = m_gas, scale = scale)
+
+        v_rot = torch.sqrt(v_stars_BH**2 + v_gas**2) 
+        return v_rot
+
+
+class NukerMGEFull(Module):
+    def __init__(self, N_MGE_components: int, Nuker_NN, NN_dtype, distance, soft, device, dtype, scaler_path, quad_points=128):
+        """
+        A velocity model that uses a trained neural network to map Nuker
+        parameters to an MGE representation.
+
+        Args:
+            trained_nn_model (MGEProfileModel): The fully trained neural network model
+                that predicts MGE profiles.
+            scaler_path (str): The file path to the saved 'StandardScaler'
+                (.joblib file) used during training.
+            device: The PyTorch device (e.g., 'cuda' or 'cpu').
+            dtype: The PyTorch data type (e.g., torch.float32).
+            mge_velocity_calculator (MGEVelocityIntr): A pre-initialized module
+                that calculates velocities from MGE components.
+        """
+        super().__init__("NukerMGEFull")
+
+        self.N_components = N_MGE_components
+        self.soft = soft
+        # pc / arcsec conversion (distance in Mpc)
+        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
+        c_t    = torch.tensor(0.648, device=device, dtype=dtype)  # so that pi/0.648 ≈ 4.848
+        self.distance_Mpc   = torch.tensor(distance, device=device, dtype=dtype)
+        self.pc_per_arcsec  = self.distance_Mpc * (pi_t / c_t)    # ≈ 4.848 * D_Mpc
+        # Small epsilon for safe logs
+        self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
+        
+        self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
+        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
+        self.NN = Nuker_NN
         
         # --- 2. Load the Scaler and create autodifferentiable buffers ---
         try:
@@ -492,35 +521,10 @@ class NukerMGEProfileModel(nn.Module):
         """ Symmetrical exponential function. Inverse of symlog. """
         linthresh_t = torch.tensor(self.linthresh, device=y.device, dtype=y.dtype)
         base_t = torch.tensor(self.base, device=y.device, dtype=y.dtype)
->>>>>>> 80725c7 (Adding new nuker model)
         one_t = torch.tensor(1.0, device=y.device, dtype=y.dtype)
     
         return torch.sign(y) * linthresh_t * (base_t**torch.abs(y) - one_t)
 
-<<<<<<< HEAD
-    @forward
-    def velocity(self, R_flat,
-                 m_gas = None, scale = None, 
-                 inc=None, qintr=None, m_bh=None,
-                 alpha = None, gmb = None, gamma = None, r_b = None, I_b = None,
-                 G=0.004301):
-        device = R_flat.device
-        dtype  = R_flat.dtype
-        beta = gamma - gmb
-
-        NN_input = torch.cat([alpha, beta, gamma])#.to(self.NN_dtype)
-        NN_output_transformed = self.NN.forward(NN_input)#.to(self.dtype)
-        NN_output = self.symexp(NN_output_transformed)
-        
-        surf = NN_output*10**I_b
-        MGE_sigma = self.sigma*r_b
-        v_stars_BH = self.MGE.velocity(R_map = R_flat, surf = surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
-
-        v_gas = self.gas_grav.velocity(R_flat, m_gas = m_gas, scale = scale)
-
-        v_rot = torch.sqrt(v_stars_BH**2 + v_gas**2) 
-        return v_rot
-=======
     def symlog(self, x): # <--- NEW: Symlog for analysis (not used in training)
         """ Symmetrical logarithmic function. Inverse of symexp. """
         linthresh_t = torch.tensor(self.linthresh, device=x.device, dtype=x.dtype)
@@ -596,4 +600,3 @@ class NukerToMGE_NN(nn.Module):
                           the predicted MGE surf values.
         """
         return self.layers(x)
->>>>>>> 80725c7 (Adding new nuker model)
