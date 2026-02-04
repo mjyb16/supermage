@@ -212,6 +212,77 @@ class MGEVelocityIntr(Module):
         return v_abs
 
 
+class GasSelfGrav(Module):
+    def __init__(self,intensity_model,device,dtype):
+        super().__init__("GasSelfGrav")
+        self.scale = intensity_model.scale
+        self.m_gas = Param("m_gas",  shape=())
+
+    @forward
+    def velocity(self, R_flat, m_gas = None, scale = None, G=0.004301):
+        x=R_flat/scale
+        ## based on eqn 8.74 in "Dynamics and Astrophysics of Galaxies" by Bovy 
+        prefac=((G*(10**m_gas))/(2*scale))*(x**2)
+        endfac=modified_bessel_i0(x/2)*modified_bessel_k0(x/2) - modified_bessel_i1(x/2)*modified_bessel_k1(x/2)
+        vcsqr=prefac*endfac
+        return torch.sqrt(vcsqr)
+
+class Sersic_MGE(Module):
+    def __init__(self, N_MGE_components: int, n_grid, surf_grid, distance, r_min, r_max, soft, device, dtype, quad_points=128):
+        super().__init__("SersicMGE")
+        self.N_components = N_MGE_components
+        self.soft = soft
+        self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
+        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
+        self.n_grid = n_grid
+        self.surf_grid = surf_grid
+
+        inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
+        outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
+        low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
+        high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
+        dx=(high_Gauss-low_Gauss)/self.N_components
+        
+        # --- SOLUTION ---
+        # Ensure all scalars are tensors of the correct dtype before the calculation
+        distance_t = torch.tensor(distance, device=device, dtype=dtype)
+        pi_t = torch.tensor(np.pi, device=device, dtype=dtype)
+        
+        self.sigma = (distance_t * (pi_t / 0.648)) * 10**(low_Gauss + (0.5 + torch.arange(self.N_components, device=device, dtype=dtype)) * dx)
+        
+        self.inc   = Param("inc",   shape=())
+        self.qintr = Param("qintr", shape=())
+        self.qintr_shaper = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.m_bh  = Param("m_bh",  shape=())
+        self.MGE.inc = self.inc
+        self.MGE.m_bh = self.m_bh
+
+        self.n = Param("n", shape=(1, ))
+        self.r_e = Param("r_e", shape = ())
+        self.I_e = Param("intensity_r_e", shape = ())
+        self.dtype = dtype
+
+    @forward
+    def velocity(self, R_flat,
+                 inc=None, qintr=None, m_bh=None,
+                 n = None, r_e = None, I_e = None,
+                 G=0.004301):
+        device = R_flat.device
+        dtype  = R_flat.dtype
+
+        surf=torch.zeros(self.N_components, device=device, dtype=dtype)
+
+        for i in range(self.N_components):
+            surf[i]=interp1d(self.n_grid,self.surf_grid[:,i],n,extend="extrapolate")
+        
+        MGE_surf = surf*10**I_e
+        MGE_sigma = self.sigma*r_e
+        v_rot = self.MGE.velocity(R_map = R_flat, surf = MGE_surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
+        return v_rot
+
 class Sersic_Gas(Module):
     def __init__(self, gas_grav_model, N_MGE_components: int, n_grid, surf_grid, distance, r_min, r_max, soft, device, dtype, quad_points=128):
         super().__init__("Sersic_Gas")
