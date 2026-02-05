@@ -555,6 +555,7 @@ class NukerMGEProfileModel(nn.Module):
             symexp_cap (float): Smoothing parameter for symexp (prevents absurd exponent growth while still allowing large dynamic range)
             symexp_softabs_eps (float): Small epsilon to avoid small values in symexp (underflow)
         """
+        super(NukerMGEProfileModel, self).__init__()
         self.n_gauss_model = int(n_gauss_model)
         self.nuker_to_mge_net = NukerToMGE_NN(n_gauss=self.n_gauss_model)
 
