@@ -573,14 +573,14 @@ class NukerMGEProfileModel(nn.Module):
         sigma_grid_np = 10 ** (low_Gauss + (0.5 + np.arange(self.n_gauss_model)) * dx)
         self.register_buffer("sigma_grid", torch.tensor(sigma_grid_np, dtype=torch.float32))
 
-    def _soft_abs(self, y: torch.Tensor) -> torch.Tensor:
+    def _soft_abs(self, y: torch.Tensor):
         """Optional smooth |y| near 0: sqrt(y^2 + eps^2). If eps==0, just abs(y)."""
         if self.symexp_softabs_eps <= 0.0:
             return torch.abs(y)
         eps = torch.tensor(self.symexp_softabs_eps, device=y.device, dtype=y.dtype)
         return torch.sqrt(y * y + eps * eps)
 
-    def symexp(self, y: torch.Tensor) -> torch.Tensor:
+    def symexp(self, y: torch.Tensor):
         """
         Signed symexp, numerically stable + optional soft cap:
 
@@ -601,12 +601,12 @@ class NukerMGEProfileModel(nn.Module):
 
         return torch.sign(y) * lin * torch.expm1(logb * a)
 
-    def get_mge_params(self, nuker_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_mge_params(self, nuker_params: torch.Tensor):
         compressed_surfs = self.nuker_to_mge_net(nuker_params)
         predicted_surfs = self.symexp(compressed_surfs)
         return predicted_surfs, self.sigma_grid
 
-    def forward(self, nuker_params: torch.Tensor, r_space_eval: torch.Tensor) -> torch.Tensor:
+    def forward(self, nuker_params: torch.Tensor, r_space_eval: torch.Tensor):
         predicted_surfs, sigmas = self.get_mge_params(nuker_params)
         r2 = r_space_eval.view(1, 1, -1) ** 2
         s2 = (2.0 * sigmas.view(1, -1, 1) ** 2)
