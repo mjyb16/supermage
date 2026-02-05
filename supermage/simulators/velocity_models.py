@@ -542,7 +542,7 @@ class NukerMGEProfileModel(nn.Module):
     A neural network-based model that predicts the MGE mass profile from Nuker parameters. Use this class to train the neural network and load it into NukerMGEFull!
     """
     def __init__(self, n_gauss_model, n_radii_data=100, r_min=1, r_max=10000, 
-                 linthresh=1e-5, base=10.0): # <--- NEW: Hyperparameters for symexp
+                 linthresh=1e-5, base=10.0, symexp_cap = 5.0, symexp_softabs_eps = 0.0):
         """
         Initializes the model and the fixed sigma grid.
         Args:
@@ -552,64 +552,66 @@ class NukerMGEProfileModel(nn.Module):
             r_max (float): The maximum radius (in pc) for the sigma grid calculation.
             linthresh (float): The threshold for the linear region of symexp/symlog.
             base (float): The base for the exponential/logarithmic part of the transform.
+            symexp_cap (float): Smoothing parameter for symexp (prevents absurd exponent growth while still allowing large dynamic range)
+            symexp_softabs_eps (float): Small epsilon to avoid small values in symexp (underflow)
         """
-        super(NukerMGEProfileModel, self).__init__()
-        self.n_gauss_model = n_gauss_model
+        self.n_gauss_model = int(n_gauss_model)
         self.nuker_to_mge_net = NukerToMGE_NN(n_gauss=self.n_gauss_model)
-        
-        # Store symexp parameters
-        self.linthresh = linthresh # <--- NEW
-        self.base = base         # <--- NEW
 
+        self.linthresh = float(linthresh)
+        self.base = float(base)
+
+        # Smoothing knobs
+        self.symexp_cap = None if symexp_cap is None else float(symexp_cap)
+        self.symexp_softabs_eps = float(symexp_softabs_eps)
+
+        # Fixed sigma grid
         r_space_basis = np.geomspace(r_min, r_max, n_radii_data)
         low_Gauss = np.log10(np.min(r_space_basis) / np.sqrt(3.0))
         high_Gauss = np.log10(np.max(r_space_basis) / np.sqrt(3.0))
         dx = (high_Gauss - low_Gauss) / self.n_gauss_model
-        sigma_grid_np = 10**(low_Gauss + (0.5 + np.arange(self.n_gauss_model)) * dx)
-        
-        self.register_buffer('sigma_grid', torch.tensor(sigma_grid_np, dtype=torch.float32))
+        sigma_grid_np = 10 ** (low_Gauss + (0.5 + np.arange(self.n_gauss_model)) * dx)
+        self.register_buffer("sigma_grid", torch.tensor(sigma_grid_np, dtype=torch.float32))
 
-    def symexp(self, y): # <--- NEW: Symexp transformation method
-        """ Symmetrical exponential function. Inverse of symlog. """
-        linthresh_t = torch.tensor(self.linthresh, device=y.device, dtype=y.dtype)
-        base_t = torch.tensor(self.base, device=y.device, dtype=y.dtype)
-        one_t = torch.tensor(1.0, device=y.device, dtype=y.dtype)
-    
-        return torch.sign(y) * linthresh_t * (base_t**torch.abs(y) - one_t)
+    def _soft_abs(self, y: torch.Tensor) -> torch.Tensor:
+        """Optional smooth |y| near 0: sqrt(y^2 + eps^2). If eps==0, just abs(y)."""
+        if self.symexp_softabs_eps <= 0.0:
+            return torch.abs(y)
+        eps = torch.tensor(self.symexp_softabs_eps, device=y.device, dtype=y.dtype)
+        return torch.sqrt(y * y + eps * eps)
 
-    def symlog(self, x): # <--- NEW: Symlog for analysis (not used in training)
-        """ Symmetrical logarithmic function. Inverse of symexp. """
-        linthresh_t = torch.tensor(self.linthresh, device=x.device, dtype=x.dtype)
-        base_t = torch.tensor(self.base, device=x.device, dtype=x.dtype)
-        one_t = torch.tensor(1.0, device=x.device, dtype=x.dtype)
-
-        return torch.sign(x) * torch.log10(torch.abs(x) / linthresh_t + one_t)
-
-    def get_mge_params(self, nuker_params):
+    def symexp(self, y: torch.Tensor) -> torch.Tensor:
         """
-        Exposes the MGE parameters after applying the symexp transform.
+        Signed symexp, numerically stable + optional soft cap:
+
+          symexp(y) = sign(y) * linthresh * (base**a - 1)
+                    = sign(y) * linthresh * expm1(log(base)*a)
+
+        where a = |y| (optionally smoothed), and optionally:
+          a <- cap * tanh(a/cap)
         """
-        # The core NN now predicts the *compressed* surf values
-        compressed_surfs = self.nuker_to_mge_net(nuker_params) # <--- CHANGED
-        
-        # Apply the symexp transform to get the true, high-dynamic-range surf values
-        predicted_surfs = self.symexp(compressed_surfs) # <--- CHANGED
-        
+        lin = torch.tensor(self.linthresh, device=y.device, dtype=y.dtype)
+        base = torch.tensor(self.base, device=y.device, dtype=y.dtype)
+        logb = torch.log(base)
+
+        a = self._soft_abs(y)
+        if self.symexp_cap is not None:
+            cap = torch.tensor(self.symexp_cap, device=y.device, dtype=y.dtype)
+            a = cap * torch.tanh(a / cap)
+
+        return torch.sign(y) * lin * torch.expm1(logb * a)
+
+    def get_mge_params(self, nuker_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        compressed_surfs = self.nuker_to_mge_net(nuker_params)
+        predicted_surfs = self.symexp(compressed_surfs)
         return predicted_surfs, self.sigma_grid
 
-    def forward(self, nuker_params, r_space_eval):
-        """
-        Predicts the MGE mass profile. This function does not need to change.
-        """
-        # This method automatically uses the new get_mge_params method
+    def forward(self, nuker_params: torch.Tensor, r_space_eval: torch.Tensor) -> torch.Tensor:
         predicted_surfs, sigmas = self.get_mge_params(nuker_params)
-        
-        r_squared = r_space_eval.view(1, 1, -1)**2
-        sigmas_squared = (2 * sigmas.view(1, -1, 1)**2)
-        
-        gaussians = torch.exp(-r_squared / sigmas_squared)
-        mass_profile = torch.sum(predicted_surfs.unsqueeze(2) * gaussians, dim=1)
-        return mass_profile
+        r2 = r_space_eval.view(1, 1, -1) ** 2
+        s2 = (2.0 * sigmas.view(1, -1, 1) ** 2)
+        gaussians = torch.exp(-r2 / s2)
+        return torch.sum(predicted_surfs.unsqueeze(2) * gaussians, dim=1)
 
 class NukerToMGE_NN(nn.Module):
     """
