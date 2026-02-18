@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from torch import Tensor
+from typing import Literal
 from torch import pi, sqrt
 from torch.special import modified_bessel_i0, modified_bessel_i1, modified_bessel_k0, modified_bessel_k1
 from caskade import Module, forward, Param
@@ -29,6 +31,74 @@ def leggauss_interval(n, t_low, t_high, device=None, dtype=None):
     w = half.unsqueeze(-1) * w0
     return x, w
 
+def _h_poly(t):
+    """Helper function to compute the 'h' polynomial matrix used in the
+    cubic spline.
+
+    Parameters
+    ----------
+    t: Tensor
+        A 1D tensor representing the normalized x values.
+
+    Returns
+    -------
+    Tensor
+        A 2D tensor of size (4, len(t)) representing the 'h' polynomial matrix.
+
+    """
+
+    tt = t[None, :] ** (torch.arange(4, device=t.device)[:, None])
+    A = torch.tensor(
+        [[1, 0, -3, 2], [0, 1, -2, 1], [0, 0, 3, -2], [0, 0, -1, 1]],
+        dtype=t.dtype,
+        device=t.device,
+    )
+    return A @ tt
+
+### A modified version of the caustics interpolation
+def interp1d(
+    x: Tensor,
+    y: Tensor,
+    xs: Tensor,
+    extend: Literal["extrapolate", "const", "linear"] = "extrapolate",
+) -> Tensor:
+    """Compute the 1D cubic spline interpolation for the given data points
+    using PyTorch.
+
+    Parameters
+    ----------
+    x: Tensor
+        A 1D tensor representing the x-coordinates of the known data points.
+    y: Tensor
+        A 1D tensor representing the y-coordinates of the known data points.
+    xs: Tensor
+        A 1D tensor representing the x-coordinates of the positions where
+        the cubic spline function should be evaluated.
+    extend: (str, optional)
+        The method for handling extrapolation, either "const", "extrapolate", or "linear".
+        Default is "extrapolate".
+        "const": Use the value of the last known data point for extrapolation.
+        "linear": Use linear extrapolation based on the last two known data points.
+        "extrapolate": Use cubic extrapolation of data.
+
+    Returns
+    -------
+    Tensor
+        A 1D tensor representing the interpolated values at the specified positions (xs).
+
+    """
+    m = (y[1:] - y[:-1]) / (x[1:] - x[:-1])
+    m = torch.cat([m[[0]], (m[1:] + m[:-1]) / 2, m[[-1]]])
+    idxs = torch.searchsorted(x[:-1].contiguous(), xs) - 1
+    dx = x[idxs + 1] - x[idxs]
+    hh = _h_poly((xs - x[idxs]) / dx)
+    ret = hh[0] * y[idxs] + hh[1] * m[idxs] * dx + hh[2] * y[idxs + 1] + hh[3] * m[idxs + 1] * dx  # fmt: skip
+    if extend == "const":
+        ret[xs > x[-1]] = y[-1]
+    elif extend == "linear":
+        indices = xs > x[-1]
+        ret[indices] = y[-1] + (xs[indices] - x[-1]) * (y[-1] - y[-2]) / (x[-1] - x[-2])
+    return ret
 
 def transform_DE(t):
     """
@@ -239,6 +309,7 @@ class Sersic_MGE(Module):
         self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
         self.n_grid = n_grid
         self.surf_grid = surf_grid
+        self.surf=torch.zeros(self.N_components, device=device, dtype=dtype)
 
         inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
         outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
@@ -273,16 +344,14 @@ class Sersic_MGE(Module):
         device = R_flat.device
         dtype  = R_flat.dtype
 
-        surf=torch.zeros(self.N_components, device=device, dtype=dtype)
-
         for i in range(self.N_components):
-            surf[i]=interp1d(self.n_grid,self.surf_grid[:,i],n,extend="extrapolate")
+            self.surf[i]=interp1d(self.n_grid,self.surf_grid[:,i],n,extend="extrapolate")
         
-        MGE_surf = surf*10**I_e
+        MGE_surf = self.surf*10**I_e
         MGE_sigma = self.sigma*r_e
         v_rot = self.MGE.velocity(R_map = R_flat, surf = MGE_surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
         return v_rot
-
+                     
 class Sersic_Gas(Module):
     def __init__(self, gas_grav_model, N_MGE_components: int, n_grid, surf_grid, distance, r_min, r_max, soft, device, dtype, quad_points=128):
         super().__init__("Sersic_Gas")
@@ -299,6 +368,7 @@ class Sersic_Gas(Module):
         self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
         self.n_grid = n_grid
         self.surf_grid = surf_grid
+        self.surf=torch.zeros(self.N_components, device=device, dtype=dtype)
 
         inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
         outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
@@ -334,12 +404,10 @@ class Sersic_Gas(Module):
         device = R_flat.device
         dtype  = R_flat.dtype
 
-        surf=torch.zeros(self.N_components, device=device, dtype=dtype)
-
         for i in range(self.N_components):
-            surf[i]=interp1d(self.n_grid,self.surf_grid[:,i],n,extend="extrapolate")
+            self.surf[i]=interp1d(self.n_grid,self.surf_grid[:,i],n,extend="extrapolate")
         
-        MGE_surf = surf*10**I_e
+        MGE_surf = self.surf*10**I_e
         MGE_sigma = self.sigma*r_e
         v_stars_BH = self.MGE.velocity(R_map = R_flat, surf = MGE_surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
         
