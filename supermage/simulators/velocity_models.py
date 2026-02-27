@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
-from typing import Literal
+from typing import Literal, Optional, Tuple
 from torch import pi, sqrt
 from torch.special import modified_bessel_i0, modified_bessel_i1, modified_bessel_k0, modified_bessel_k1
 from caskade import Module, forward, Param
@@ -11,6 +12,7 @@ from torch.nn.functional import conv2d, avg_pool2d
 from functools import lru_cache
 import math
 import joblib
+
 
 @lru_cache(maxsize=None)
 def _leggauss_const(n, dtype, device):
@@ -720,6 +722,383 @@ class NukerToMGE_NN(nn.Module):
                           the predicted MGE surf values.
         """
         return self.layers(x)
+
+
+########################################################## EXPERIMENTAL ####################################################################
+
+# -----------------------------
+# Helper: precomputed ridge projector for MGE coefficients
+# -----------------------------
+class PrecomputedMGEProjector(torch.nn.Module):
+    """
+    Fixed basis A_ij = exp(-R_i^2 / (2 sigma_j^2))  (no normalization, matching your NN forward)
+    Precompute ridge projector:
+        P = (A^T A + lam I)^-1 A^T    so surf = P @ y
+    """
+    def __init__(
+        self,
+        *,
+        r_grid_pc: torch.Tensor,     # (R,)
+        sigma_grid_pc: torch.Tensor, # (K,)
+        lam_base: float = 1e-6,
+        max_jitter_tries: int = 12,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device = torch.device("cpu"),
+    ):
+        super().__init__()
+        self.register_buffer("r_grid", r_grid_pc.to(device=device, dtype=dtype))
+        self.register_buffer("sigma_grid", sigma_grid_pc.to(device=device, dtype=dtype))
+
+        # Build A in float32 for runtime usage
+        r = self.r_grid
+        sig = self.sigma_grid
+        A = torch.exp(-(r[:, None] ** 2) / (2.0 * sig[None, :] ** 2))  # (R,K)
+        self.register_buffer("A", A)
+
+        # Precompute P in float64 for robustness, then cast back
+        A64 = A.to(torch.float64)
+        R, K = A64.shape
+        AtA64 = A64.T @ A64
+        I64 = torch.eye(K, device=device, dtype=torch.float64)
+
+        lam = float(lam_base)
+        L = None
+        for _ in range(max_jitter_tries):
+            try:
+                M64 = AtA64 + lam * I64
+                L = torch.linalg.cholesky(M64)
+                break
+            except Exception:
+                lam *= 10.0
+
+        if L is None:
+            raise RuntimeError(
+                "Failed to Cholesky-factor (A^T A + λI) even after jitter escalation. "
+                "Try increasing lam_base or reducing K."
+            )
+
+        P64 = torch.cholesky_solve(A64.T, L)  # (K,R)
+        P = P64.to(dtype=dtype)
+        self.register_buffer("P", P)          # (K,R)
+        self.lam_used = lam                  # python float, for debugging
+
+    def surf_from_profile(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        y: (R,) or (B,R)
+        returns surf: (K,) or (B,K)
+        """
+        if y.ndim == 1:
+            return self.P @ y
+        elif y.ndim == 2:
+            # (B,R) -> (B,K) via y @ P^T
+            return y @ self.P.T
+        else:
+            raise ValueError(f"y must be 1D or 2D, got shape {tuple(y.shape)}")
+
+    def profile_from_surf(self, surf: torch.Tensor) -> torch.Tensor:
+        """
+        surf: (K,) or (B,K)
+        returns yhat: (R,) or (B,R)
+        """
+        if surf.ndim == 1:
+            return self.A @ surf
+        elif surf.ndim == 2:
+            return surf @ self.A.T
+        else:
+            raise ValueError(f"surf must be 1D or 2D, got shape {tuple(surf.shape)}")
+
+
+# -----------------------------
+# Nuker -> profile on r_grid (Torch)
+# -----------------------------
+def nuker_profile_torch_1d(R, I_b, r_b, alpha, beta, gamma, eps=1e-30):
+    """
+    All inputs scalar tensors; R is (R,)
+    """
+    R = torch.clamp(R, min=eps)
+    r_b = torch.clamp(r_b, min=eps)
+    alpha = torch.clamp(alpha, min=eps)
+
+    x = torch.clamp(R / r_b, min=eps)
+    two = torch.tensor(2.0, device=R.device, dtype=R.dtype)
+    pref = I_b * torch.pow(two, (beta - gamma) / alpha)
+    core = torch.pow(x, -gamma)
+    outer = torch.pow(1.0 + torch.pow(x, alpha), (gamma - beta) / alpha)
+    return pref * core * outer  # (R,)
+
+
+# -----------------------------
+# Core-Sérsic -> profile on r_grid (Torch)
+# -----------------------------
+def core_sersic_torch_1d(R, I_b, R_b, R_e, alpha, gamma, n, eps=1e-30):
+    """
+    All inputs scalar tensors; R is (R,)
+    """
+    R   = torch.clamp(R,   min=eps)
+    R_b = torch.clamp(R_b, min=eps)
+    R_e = torch.clamp(R_e, min=eps)
+    alpha = torch.clamp(alpha, min=eps)
+    n     = torch.clamp(n, min=eps)
+
+    # b_n approximation
+    b_n = 2.0*n - (1.0/3.0) + 4.0/(405.0*n) + 46.0/(25515.0*n*n)
+
+    term1 = torch.pow(1.0 + torch.pow(R_b / R, alpha), gamma / alpha)
+
+    inside = (torch.pow(R, alpha) + torch.pow(R_b, alpha)) / torch.pow(R_e, alpha)
+    term2 = torch.exp(-b_n * (torch.pow(inside, 1.0/(alpha*n)) - 1.0))
+
+    return I_b * term1 * term2  # (R,)
+
+
+# ============================================================================
+# Full models in the style of NukerMGEFull, but using Precomputed LS projectors
+# ============================================================================
+
+class NukerMGEFull_PreLS(Module):
+    """
+    Mirrors NukerMGEFull architecture, but uses precomputed LS:
+      Nuker params -> profile y(R_grid) -> surf = P@y -> MGE velocity
+    """
+    def __init__(
+        self,
+        N_MGE_components: int,
+        *,
+        distance_Mpc: float,
+        soft: float,
+        device,
+        dtype,
+        # MGE grid config
+        n_radii_data: int = 100,
+        r_min_pc: float = 1.0,
+        r_max_pc: float = 1e4,
+        # LS regularization
+        lam_base: float = 1e-6,
+        max_jitter_tries: int = 12,
+        # velocity module config
+        quad_points: int = 128,
+        radius_res: int = 4096,
+        G: float = 0.004301
+    ):
+        super().__init__("NukerMGEFull_PreLS")
+        self.device = device
+        self.dtype  = dtype
+
+        # pc / arcsec conversion (distance in Mpc)
+        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
+        c_t    = torch.tensor(0.648, device=device, dtype=dtype)  # pi/0.648 ≈ 4.848
+        self.distance_Mpc  = torch.tensor(distance_Mpc, device=device, dtype=dtype)
+        self.pc_per_arcsec = self.distance_Mpc * (pi_t / c_t)
+
+        self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
+        self.G = torch.tensor(G, device=device, dtype=dtype)
+
+        # Fixed radius grid used for LS fit
+        r_grid = torch.tensor(np.geomspace(r_min_pc, r_max_pc, n_radii_data),
+                              device=device, dtype=dtype)
+
+        # Fixed sigma grid (exactly the scheme from your NN model)
+        low_G = np.log10(np.min(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
+        high_G = np.log10(np.max(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
+        dx = (high_G - low_G) / N_MGE_components
+        sigma_grid_np = 10**(low_G + (0.5 + np.arange(N_MGE_components))*dx)
+        sigma_grid = torch.tensor(sigma_grid_np, device=device, dtype=dtype)
+
+        # Precomputed projector (constant buffers)
+        self.projector = PrecomputedMGEProjector(
+            r_grid_pc=r_grid,
+            sigma_grid_pc=sigma_grid,
+            lam_base=lam_base,
+            max_jitter_tries=max_jitter_tries,
+            dtype=dtype,
+            device=device
+        )
+
+        # MGE velocity calculator
+        self.MGE = MGEVelocityIntr(
+            N_components=N_MGE_components,
+            device=device,
+            dtype=dtype,
+            quad_points=quad_points,
+            radius_res=radius_res,
+            soft=soft,
+            G=G,
+        )
+
+        # Link galaxy parameters (same pattern as your NukerMGEFull)
+        self.inc   = Param("inc",   shape=())
+        self.qintr = Param("qintr", shape=())
+        self.m_bh  = Param("m_bh",  shape=())
+
+        self.MGE.inc  = self.inc
+        self.MGE.m_bh = self.m_bh
+
+        # These are the four Nuker parameters (same naming you used)
+        self.alpha = Param("alpha", shape=(1,))
+        self.gmb   = Param("gamma_minus_beta", shape=(1,))  # gmb = gamma - beta
+        self.gamma = Param("gamma", shape=(1,))
+        self.r_b   = Param("r_b", shape=(1,))               # break radius (arcsec)
+        self.I_b   = Param("intensity_r_b", shape=())       # log10(I_b) in your usage
+
+        # broadcast helper for qintr per component
+        self.qintr_shaper = torch.ones((N_MGE_components,), device=device, dtype=dtype)
+
+    @forward
+    def velocity(
+        self,
+        R_flat,                         # 2-D tensor [H,W] in pc (as in your MGEVelocityIntr usage)
+        inc=None, qintr=None, m_bh=None,
+        alpha=None, gmb=None, gamma=None, r_b=None, I_b=None,
+    ):
+        # Convert Nuker params to profile params
+        beta = gamma - gmb  # matches your NukerMGEFull convention
+
+        # r_b is in arcsec -> pc
+        r_b_pc = torch.clamp(r_b * self.pc_per_arcsec, min=self._eps)
+        I_b_lin = torch.pow(torch.tensor(10.0, device=self.device, dtype=self.dtype), I_b)
+
+        # Evaluate Nuker profile on projector radius grid
+        y = nuker_profile_torch_1d(
+            self.projector.r_grid,
+            I_b_lin,
+            r_b_pc.squeeze(),
+            alpha.squeeze(),
+            beta.squeeze(),
+            gamma.squeeze(),
+            eps=float(self._eps.item()),
+        )  # (R,)
+
+        # LS: surf = P @ y
+        surf = self.projector.surf_from_profile(y)      # (K,)
+        sigma = self.projector.sigma_grid               # (K,)
+
+        # Compute velocity
+        v_rot = self.MGE.velocity(
+            R_map=R_flat,
+            surf=surf,
+            sigma=sigma,
+            qintr=qintr * self.qintr_shaper
+        )
+        return v_rot
+
+
+class CoreSersicMGEFull_PreLS(Module):
+    """
+    Same architecture idea, but Core-Sérsic parameters -> profile -> surf via precomputed LS.
+    """
+    def __init__(
+        self,
+        N_MGE_components: int,
+        *,
+        distance_Mpc: float,
+        soft: float,
+        device,
+        dtype,
+        # grids
+        n_radii_data: int = 100,
+        r_min_pc: float = 1.0,
+        r_max_pc: float = 1e4,
+        # LS regularization
+        lam_base: float = 1e-6,
+        max_jitter_tries: int = 12,
+        # velocity module
+        quad_points: int = 128,
+        radius_res: int = 4096,
+        G: float = 0.004301
+    ):
+        super().__init__("CoreSersicMGEFull_PreLS")
+        self.device = device
+        self.dtype  = dtype
+
+        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
+        c_t    = torch.tensor(0.648, device=device, dtype=dtype)
+        self.distance_Mpc  = torch.tensor(distance_Mpc, device=device, dtype=dtype)
+        self.pc_per_arcsec = self.distance_Mpc * (pi_t / c_t)
+
+        self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
+        self.G = torch.tensor(G, device=device, dtype=dtype)
+
+        r_grid = torch.tensor(np.geomspace(r_min_pc, r_max_pc, n_radii_data),
+                              device=device, dtype=dtype)
+
+        # sigma grid (same scheme)
+        low_G = np.log10(np.min(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
+        high_G = np.log10(np.max(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
+        dx = (high_G - low_G) / N_MGE_components
+        sigma_grid_np = 10**(low_G + (0.5 + np.arange(N_MGE_components))*dx)
+        sigma_grid = torch.tensor(sigma_grid_np, device=device, dtype=dtype)
+
+        self.projector = PrecomputedMGEProjector(
+            r_grid_pc=r_grid,
+            sigma_grid_pc=sigma_grid,
+            lam_base=lam_base,
+            max_jitter_tries=max_jitter_tries,
+            dtype=dtype,
+            device=device
+        )
+
+        self.MGE = MGEVelocityIntr(
+            N_components=N_MGE_components,
+            device=device,
+            dtype=dtype,
+            quad_points=quad_points,
+            radius_res=radius_res,
+            soft=soft,
+            G=G,
+        )
+
+        # galaxy params
+        self.inc   = Param("inc",   shape=())
+        self.qintr = Param("qintr", shape=())
+        self.m_bh  = Param("m_bh",  shape=())
+
+        self.MGE.inc  = self.inc
+        self.MGE.m_bh = self.m_bh
+
+        # Core-Sérsic params
+        self.I_b   = Param("I_b",   shape=())        # log10(I_b) (consistent with Nuker version)
+        self.R_b   = Param("R_b",   shape=(1,))      # arcsec
+        self.R_e   = Param("R_e",   shape=(1,))      # arcsec
+        self.alpha = Param("alpha", shape=(1,))
+        self.gamma = Param("gamma", shape=(1,))
+        self.n     = Param("n",     shape=(1,))
+
+        self.qintr_shaper = torch.ones((N_MGE_components,), device=device, dtype=dtype)
+
+    @forward
+    def velocity(
+        self,
+        R_flat,
+        inc=None, qintr=None, m_bh=None,
+        I_b=None, R_b=None, R_e=None, alpha=None, gamma=None, n=None
+    ):
+        # arcsec -> pc
+        R_b_pc = torch.clamp(R_b * self.pc_per_arcsec, min=self._eps)
+        R_e_pc = torch.clamp(R_e * self.pc_per_arcsec, min=self._eps)
+        I_b_lin = torch.pow(torch.tensor(10.0, device=self.device, dtype=self.dtype), I_b)
+
+        # profile on r_grid
+        y = core_sersic_torch_1d(
+            self.projector.r_grid,
+            I_b_lin,
+            R_b_pc.squeeze(),
+            R_e_pc.squeeze(),
+            alpha.squeeze(),
+            gamma.squeeze(),
+            n.squeeze(),
+            eps=float(self._eps.item()),
+        )
+
+        surf = self.projector.surf_from_profile(y)
+        sigma = self.projector.sigma_grid
+
+        v_rot = self.MGE.velocity(
+            R_map=R_flat,
+            surf=surf,
+            sigma=sigma,
+            qintr=qintr * self.qintr_shaper
+        )
+        return v_rot
 
 
 
