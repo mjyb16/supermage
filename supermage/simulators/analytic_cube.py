@@ -5,9 +5,19 @@ from supermage.utils.doppler_velocities import create_velocity_grid_stable
 # ----------------------------------------------------------------------
 # Helper: equal-probability Gaussian abscissae -------------------------
 # ----------------------------------------------------------------------
-def gaussian_quantile_offsets(sigma, K, *, device, dtype):
+def gaussian_quantile_offsets_flex(sigma, K, *, device, dtype):
+    """
+    Deterministic mid-quantile offsets for N(0, sigma^2).
+    Works with scalar or per-pixel sigma:
+      - if sigma is scalar: returns (K,1,1)
+      - if sigma is (H,W): returns (K,H,W)
+    """
     p_mid = (torch.arange(K, device=device, dtype=dtype) + 0.5) / K
-    return sigma * math.sqrt(2.0) * torch.erfinv(2.0 * p_mid - 1.0)
+    unit = math.sqrt(2.0) * torch.erfinv(2.0 * p_mid - 1.0)  # (K,)
+    if sigma.ndim == 0:
+        return (sigma * unit).view(K, 1, 1)
+    else:
+        return unit.view(K, 1, 1) * sigma.view(1, *sigma.shape)
 
 def make_dv_table(N_clouds, K_vel, *, seed, device, dtype):
     """
@@ -26,8 +36,218 @@ def make_dv_table(N_clouds, K_vel, *, seed, device, dtype):
 
 
 # ----------------------------------------------------------------------
+# Inverse-mapped analytic renderer
+# ----------------------------------------------------------------------
+class AnalyticInverse(Module):
+    """
+    Analytic renderer that:
+      - builds a sky-plane grid (x_sky, y_sky) in arcsec,
+      - subtracts source offsets,
+      - inverts the sky projection to intrinsic (x_gal, y_gal),
+      - evaluates analytic intensity/velocity fields,
+      - applies deterministic Gaussian-quantile broadening in velocity,
+      - bins into a hi-res (V,H,W) cube and box-filters to low-res.
+    """
+
+    def __init__(
+        self,
+        intensity_model,           # analytic model: brightness(R)
+        velocity_model,            # analytic model: velocity(R)
+        freq_axis,                 # (Nv,) uniform freqs for output cube
+        pixel_scale_arcsec,        # arcsec / pixel on image plane
+        N_pix_x,                   # output pixels side (square)
+        *,
+        K_vel: int = 8,
+        oversamp_xy: int = 4,
+        oversamp_v: int = 4,
+        chunk_v: int | None = None,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float32,
+        line: float = 230.538,
+        name: str = "analytic_inverse",
+    ):
+        super().__init__(name)
+        self.device, self.dtype = device, dtype
+        self.intensity_model = intensity_model
+        self.velocity_model  = velocity_model
+
+        # User-facing parameters
+        self.inclination     = Param("inclination",     None)   # [rad]
+        self.velocity_model.inc = self.inclination
+        self.sky_rot         = Param("sky_rot",         None)   # [rad]
+        self.line_broadening = Param("line_broadening", None)   # [km/s]
+        self.velocity_shift  = Param("velocity_shift",  None)   # [km/s]
+        self.x0              = Param("x0",              None)   # [arcsec]
+        self.y0              = Param("y0",              None)   # [arcsec]
+        self.distance_pc     = Param("distance_pc",     None)   # [pc]
+
+        # Velocity grid
+        from supermage.utils.doppler_velocities import create_velocity_grid_stable
+        vel_axis, _ = create_velocity_grid_stable(
+            f_start=freq_axis[0],
+            f_end=freq_axis[-1],
+            num_points=len(freq_axis),
+            target_dtype=dtype,
+            line=line,
+        )
+        self.vel0_lo = vel_axis[0].to(dtype)
+        self.dv_lo   = float((vel_axis[1] - vel_axis[0]).item())
+        self.Nv_lo   = int(vel_axis.numel())
+
+        self.oversamp_v = int(oversamp_v)
+        self.dv_hi      = self.dv_lo / self.oversamp_v
+        delta           = 0.5 * (self.dv_lo - self.dv_hi)
+        self.vel0_hi    = self.vel0_lo - delta
+        self.Nv_hi      = self.Nv_lo * self.oversamp_v
+
+        self.K_vel   = int(K_vel)
+        self.chunk_v = int(chunk_v) if (chunk_v is not None) else None
+
+        # Spatial grids
+        self.pixscale_lo = float(pixel_scale_arcsec)
+        self.N_pix_lo    = int(N_pix_x)
+        self.N_pix       = self.N_pix_lo
+        self.fov_half_lo = 0.5 * (self.N_pix_lo - 1) * self.pixscale_lo
+
+        self.oversamp_xy = int(oversamp_xy)
+        self.pixscale_hi = self.pixscale_lo / self.oversamp_xy
+        self.N_pix_hi    = self.N_pix_lo * self.oversamp_xy
+        self.fov_half_hi = 0.5 * (self.N_pix_hi - 1) * self.pixscale_hi
+
+        # Build sky-plane grid directly in arcsec
+        xs = (-self.fov_half_hi) + self.pixscale_hi * torch.arange(
+            self.N_pix_hi, device=device, dtype=dtype
+        )
+        ys = (-self.fov_half_hi) + self.pixscale_hi * torch.arange(
+            self.N_pix_hi, device=device, dtype=dtype
+        )
+        self.xsky = xs.view(1, -1).expand(self.N_pix_hi, -1)   # (H,W), east
+        self.ysky = ys.view(-1, 1).expand(-1, self.N_pix_hi)   # (H,W), north
+
+        # Precompute flat spatial indices
+        yy = torch.arange(self.N_pix_hi, device=device)
+        xx = torch.arange(self.N_pix_hi, device=device)
+        Y, X = torch.meshgrid(yy, xx, indexing="ij")
+        self.Y_flat = Y.reshape(1, -1)
+        self.X_flat = X.reshape(1, -1)
+        self.hw     = int(self.N_pix_hi * self.N_pix_hi)
+
+    def _sky_to_intrinsic(self, x_sky_arcsec, y_sky_arcsec, *, x0, y0, pa, cos_i, arcsec_per_pc):
+        """
+        Invert the sky projection:
+           x_sky =  cos(pa) x_gal - sin(pa) (y_gal cos i)
+           y_sky =  sin(pa) x_gal + cos(pa) (y_gal cos i)
+
+        after subtracting source offsets and converting arcsec -> pc.
+        """
+        bx = x_sky_arcsec - x0
+        by = y_sky_arcsec - y0
+
+        X = bx / arcsec_per_pc
+        Y = by / arcsec_per_pc
+
+        cos_pa, sin_pa = torch.cos(pa), torch.sin(pa)
+        x_gal =  cos_pa * X + sin_pa * Y
+        y_gal = (-sin_pa * X + cos_pa * Y) / (cos_i + 1e-12)
+        R = torch.hypot(x_gal, y_gal)
+        return x_gal, y_gal, R
+
+    def _bin_quantiles_along_v_(self, cube_hi, v_los, I_map, sigma):
+        K = self.K_vel
+        Δv = gaussian_quantile_offsets_flex(
+            sigma.abs() + 1e-12, K, device=self.device, dtype=self.dtype
+        )
+
+        v_sub = v_los.view(1, *v_los.shape) + Δv
+        iv_f  = (v_sub - self.vel0_hi) / self.dv_hi
+        iv0   = torch.floor(iv_f).to(torch.long).clamp(0, self.Nv_hi - 1)
+        iv1   = (iv0 + 1).clamp(0, self.Nv_hi - 1)
+        fv    = (iv_f - iv0.to(iv_f.dtype)).clamp(0, 1)
+
+        fsub = (I_map / float(K)).view(1, -1)
+        iv0 = iv0.view(K, -1)
+        iv1 = iv1.view(K, -1)
+        w0  = (1 - fv).view(K, -1)
+        w1  = fv.view(K, -1)
+
+        baseY = self.Y_flat.expand(K, -1)
+        baseX = self.X_flat.expand(K, -1)
+        stride_xy = self.hw
+
+        idx0 = iv0 * stride_xy + baseY * self.N_pix_hi + baseX
+        idx1 = iv1 * stride_xy + baseY * self.N_pix_hi + baseX
+
+        flat = cube_hi.view(-1)
+        flat.scatter_add_(0, idx0.reshape(-1), (fsub * w0).reshape(-1))
+        flat.scatter_add_(0, idx1.reshape(-1), (fsub * w1).reshape(-1))
+
+    @forward
+    def forward(
+        self,
+        inclination=None,
+        sky_rot=None,
+        line_broadening=None,
+        velocity_shift=None,
+        x0=None,
+        y0=None,
+        distance_pc=None,
+        return_intermediates: bool = False,
+    ):
+        cos_i = torch.cos(inclination)
+        pa    = sky_rot + math.pi / 2.0
+        arcsec_per_pc = 206265.0 / distance_pc
+
+        # Direct sky-plane -> intrinsic
+        x_gal, y_gal, R = self._sky_to_intrinsic(
+            self.xsky, self.ysky,
+            x0=x0, y0=y0, pa=pa, cos_i=cos_i, arcsec_per_pc=arcsec_per_pc
+        )
+
+        # Analytic fields
+        I_map  = self.intensity_model.brightness(R)
+        v_circ = self.velocity_model.velocity(R)
+        cos_theta = x_gal / (R + 1e-12)
+        v_los = v_circ * torch.sin(inclination) * cos_theta + velocity_shift
+
+        # Allocate hi-res cube
+        cube_hi = torch.zeros(
+            self.Nv_hi, self.N_pix_hi, self.N_pix_hi,
+            device=self.device, dtype=self.dtype
+        )
+
+        # Velocity broadening
+        self._bin_quantiles_along_v_(cube_hi, v_los, I_map, line_broadening)
+
+        # Box-filter to low-res
+        cube_hi = cube_hi.view(
+            self.Nv_lo, self.oversamp_v,
+            self.N_pix_lo, self.oversamp_xy,
+            self.N_pix_lo, self.oversamp_xy
+        )
+        cube_lo = cube_hi.mean((1, 3, 5))
+
+        if return_intermediates:
+            return cube_lo, {
+                "I_map": I_map,
+                "v_los": v_los,
+                "R": R,
+                "x_gal": x_gal,
+                "y_gal": y_gal,
+                "x_sky": self.xsky,
+                "y_sky": self.ysky,
+            }
+        return cube_lo
+
+
+# ----------------------------------------------------------------------
 #  MC cloud catalogue           (only forward() was modified)
 # ----------------------------------------------------------------------
+
+def gaussian_quantile_offsets(sigma, K, *, device, dtype):
+    p_mid = (torch.arange(K, device=device, dtype=dtype) + 0.5) / K
+    return sigma * math.sqrt(2.0) * torch.erfinv(2.0 * p_mid - 1.0)
+
+
 class CloudCatalog(Module):
     def __init__(
         self,

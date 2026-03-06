@@ -305,10 +305,10 @@ class Sersic_MGE(Module):
         self.N_components = N_MGE_components
         self.soft = soft
         self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
+        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
         self.n_grid = n_grid
         self.surf_grid = surf_grid
         self.surf=torch.zeros(self.N_components, device=device, dtype=dtype)
@@ -364,10 +364,10 @@ class Sersic_Gas(Module):
         self.N_components = N_MGE_components
         self.soft = soft
         self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
+        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
         self.n_grid = n_grid
         self.surf_grid = surf_grid
         self.surf=torch.zeros(self.N_components, device=device, dtype=dtype)
@@ -428,10 +428,10 @@ class Nuker_Gas(Module):
         self.N_components = N_MGE_components
         self.soft = soft
         self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
+        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
         self.NN = Nuker_NN
 
         inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
@@ -524,10 +524,10 @@ class NukerMGEFull(Module):
         self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
         
         self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
+        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
         self.NN = Nuker_NN
         
         # --- 2. Load the Scaler and create autodifferentiable buffers ---
@@ -723,8 +723,6 @@ class NukerToMGE_NN(nn.Module):
         """
         return self.layers(x)
 
-
-########################################################## EXPERIMENTAL ####################################################################
 
 # -----------------------------
 # Helper: precomputed ridge projector for MGE coefficients
@@ -924,6 +922,10 @@ class NukerMGEFull_PreLS(Module):
             soft=soft,
             G=G,
         )
+        self.MGE.surf.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
+        self.MGE.sigma.to_static(self.projector.sigma_grid.clone())
+        self.MGE.qintr.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
+        self.MGE.M_to_L.to_static(torch.tensor(1.0, device=device, dtype=dtype))
 
         # Link galaxy parameters (same pattern as your NukerMGEFull)
         self.inc   = Param("inc",   shape=())
@@ -1046,6 +1048,10 @@ class CoreSersicMGEFull_PreLS(Module):
             soft=soft,
             G=G,
         )
+        self.MGE.surf.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
+        self.MGE.sigma.to_static(self.projector.sigma_grid.clone())
+        self.MGE.qintr.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
+        self.MGE.M_to_L.to_static(torch.tensor(1.0, device=device, dtype=dtype))
 
         # galaxy params
         self.inc   = Param("inc",   shape=())
@@ -1110,10 +1116,10 @@ class Nuker_MGE(Module):
         self.N_components = N_MGE_components
         self.soft = soft
         self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
+        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
+        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
         self.NN = Nuker_NN
 
         inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
