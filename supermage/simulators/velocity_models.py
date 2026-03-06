@@ -807,6 +807,165 @@ class PrecomputedMGEProjector(torch.nn.Module):
 
 
 # -----------------------------
+# Sérsic -> profile on r_grid (Torch)
+# -----------------------------
+def sersic_profile_torch_1d(R, I_e, R_e, n, eps=1e-30):
+    """
+    Standard Sérsic profile:
+        I(R) = I_e * exp[-b_n * ((R / R_e)^(1/n) - 1)]
+
+    Parameters
+    ----------
+    R   : (R,) tensor
+        Radius grid in pc.
+    I_e : scalar tensor
+        Intensity at effective radius.
+    R_e : scalar tensor
+        Effective radius in pc.
+    n   : scalar tensor
+        Sérsic index.
+    """
+    R   = torch.clamp(R,   min=eps)
+    R_e = torch.clamp(R_e, min=eps)
+    n   = torch.clamp(n,   min=eps)
+
+    # Standard approximation for b_n
+    b_n = 2.0*n - (1.0/3.0) + 4.0/(405.0*n) + 46.0/(25515.0*n*n)
+
+    return I_e * torch.exp(-b_n * (torch.pow(R / R_e, 1.0 / n) - 1.0))
+
+
+class SersicMGEFull_PreLS(Module):
+    """
+    Sérsic params -> profile on fixed radius grid -> PreLS MGE coefficients -> velocity
+
+    This replaces interpolation over a precomputed n-grid with an on-the-fly
+    least-squares projection onto a fixed Gaussian sigma basis.
+    """
+    def __init__(
+        self,
+        N_MGE_components: int,
+        *,
+        distance_Mpc: float,
+        soft: float,
+        device,
+        dtype,
+        # MGE/profile grid config
+        n_radii_data: int = 100,
+        r_min_pc: float = 1.0,
+        r_max_pc: float = 1e4,
+        # ridge regularization
+        lam_base: float = 1e-6,
+        max_jitter_tries: int = 12,
+        # velocity module config
+        quad_points: int = 128,
+        radius_res: int = 4096,
+        G: float = 0.004301,
+    ):
+        super().__init__("SersicMGEFull_PreLS")
+        self.device = device
+        self.dtype  = dtype
+
+        # pc / arcsec conversion (distance in Mpc)
+        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
+        c_t    = torch.tensor(0.648, device=device, dtype=dtype)  # pi/0.648 ≈ 4.848
+        self.distance_Mpc  = torch.tensor(distance_Mpc, device=device, dtype=dtype)
+        self.pc_per_arcsec = self.distance_Mpc * (pi_t / c_t)
+
+        self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
+        self.G    = torch.tensor(G, device=device, dtype=dtype)
+
+        # Fixed radius grid in pc
+        r_grid = torch.tensor(
+            np.geomspace(r_min_pc, r_max_pc, n_radii_data),
+            device=device,
+            dtype=dtype,
+        )
+
+        # Fixed sigma grid in pc, matching your existing scheme
+        low_G = np.log10(np.min(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
+        high_G = np.log10(np.max(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
+        dx = (high_G - low_G) / N_MGE_components
+        sigma_grid_np = 10 ** (low_G + (0.5 + np.arange(N_MGE_components)) * dx)
+        sigma_grid = torch.tensor(sigma_grid_np, device=device, dtype=dtype)
+
+        # Precomputed projector
+        self.projector = PrecomputedMGEProjector(
+            r_grid_pc=r_grid,
+            sigma_grid_pc=sigma_grid,
+            lam_base=lam_base,
+            max_jitter_tries=max_jitter_tries,
+            dtype=dtype,
+            device=device,
+        )
+
+        # Velocity calculator
+        self.MGE = MGEVelocityIntr(
+            N_components=N_MGE_components,
+            device=device,
+            dtype=dtype,
+            quad_points=quad_points,
+            radius_res=radius_res,
+            soft=soft,
+            G=G,
+        )
+        self.MGE.surf.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
+        self.MGE.sigma.to_static(self.projector.sigma_grid.clone())
+        self.MGE.qintr.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
+        self.MGE.M_to_L.to_static(torch.tensor(1.0, device=device, dtype=dtype))
+
+        # Galaxy params
+        self.inc   = Param("inc",   shape=())
+        self.qintr = Param("qintr", shape=())
+        self.m_bh  = Param("m_bh",  shape=())
+
+        self.MGE.inc  = self.inc
+        self.MGE.m_bh = self.m_bh
+
+        # Sérsic params
+        self.n   = Param("n",   shape=(1,))
+        self.r_e = Param("r_e", shape=())   # arcsec
+        self.I_e = Param("intensity_r_e", shape=())  # log10(I_e)
+
+        self.qintr_shaper = torch.ones((N_MGE_components,), device=device, dtype=dtype)
+
+    @forward
+    def velocity(
+        self,
+        R_flat,
+        inc=None, qintr=None, m_bh=None,
+        n=None, r_e=None, I_e=None,
+    ):
+        # arcsec -> pc
+        r_e_pc = torch.clamp(r_e * self.pc_per_arcsec, min=self._eps)
+
+        # log10(I_e) -> linear
+        I_e_lin = torch.pow(torch.tensor(10.0, device=self.device, dtype=self.dtype), I_e)
+
+        # Evaluate Sérsic profile on fixed radius grid
+        y = sersic_profile_torch_1d(
+            self.projector.r_grid,
+            I_e_lin,
+            r_e_pc.squeeze() if r_e_pc.ndim > 0 else r_e_pc,
+            n.squeeze(),
+            eps=float(self._eps.item()),
+        )  # (R,)
+
+        # Project to MGE coefficients
+        surf = self.projector.surf_from_profile(y)   # (K,)
+        sigma = self.projector.sigma_grid            # (K,)
+
+        # Velocity
+        v_rot = self.MGE.velocity(
+            R_map=R_flat,
+            surf=surf,
+            sigma=sigma,
+            qintr=qintr * self.qintr_shaper,
+        )
+        return v_rot
+
+
+# -----------------------------
 # Nuker -> profile on r_grid (Torch)
 # -----------------------------
 def nuker_profile_torch_1d(R, I_b, r_b, alpha, beta, gamma, eps=1e-30):
