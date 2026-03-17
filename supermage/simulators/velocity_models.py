@@ -284,460 +284,23 @@ class MGEVelocityIntr(Module):
         return v_abs
 
 
-class GasSelfGrav(Module):
-    def __init__(self,intensity_model,device,dtype):
-        super().__init__("GasSelfGrav")
-        self.scale = intensity_model.scale
-        self.m_gas = Param("m_gas",  shape=())
-
-    @forward
-    def velocity(self, R_flat, m_gas = None, scale = None, G=0.004301):
-        x=R_flat/scale
-        ## based on eqn 8.74 in "Dynamics and Astrophysics of Galaxies" by Bovy 
-        prefac=((G*(10**m_gas))/(2*scale))*(x**2)
-        endfac=modified_bessel_i0(x/2)*modified_bessel_k0(x/2) - modified_bessel_i1(x/2)*modified_bessel_k1(x/2)
-        vcsqr=prefac*endfac
-        return torch.sqrt(vcsqr)
-
-class Sersic_MGE(Module):
-    def __init__(self, N_MGE_components: int, n_grid, surf_grid, distance, r_min, r_max, soft, device, dtype, quad_points=128):
-        super().__init__("SersicMGE")
-        self.N_components = N_MGE_components
-        self.soft = soft
-        self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
-        self.n_grid = n_grid
-        self.surf_grid = surf_grid
-        self.surf=torch.zeros(self.N_components, device=device, dtype=dtype)
-
-        inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
-        outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
-        low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
-        high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
-        dx=(high_Gauss-low_Gauss)/self.N_components
-        
-        # --- SOLUTION ---
-        # Ensure all scalars are tensors of the correct dtype before the calculation
-        distance_t = torch.tensor(distance, device=device, dtype=dtype)
-        pi_t = torch.tensor(np.pi, device=device, dtype=dtype)
-        
-        self.sigma = (distance_t * (pi_t / 0.648)) * 10**(low_Gauss + (0.5 + torch.arange(self.N_components, device=device, dtype=dtype)) * dx)
-        
-        self.inc   = Param("inc",   shape=())
-        self.qintr = Param("qintr", shape=())
-        self.qintr_shaper = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.m_bh  = Param("m_bh",  shape=())
-        self.MGE.inc = self.inc
-        self.MGE.m_bh = self.m_bh
-
-        self.n = Param("n", shape=(1, ))
-        self.r_e = Param("r_e", shape = ())
-        self.I_e = Param("intensity_r_e", shape = ())
-        self.dtype = dtype
-
-    @forward
-    def velocity(self, R_flat,
-                 inc=None, qintr=None, m_bh=None,
-                 n = None, r_e = None, I_e = None,
-                 G=0.004301):
-        device = R_flat.device
-        dtype  = R_flat.dtype
-
-        for i in range(self.N_components):
-            self.surf[i]=interp1d(self.n_grid,self.surf_grid[:,i],n,extend="extrapolate")
-        
-        MGE_surf = self.surf*10**I_e
-        MGE_sigma = self.sigma*r_e
-        v_rot = self.MGE.velocity(R_map = R_flat, surf = MGE_surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
-        return v_rot
-                     
-class Sersic_Gas(Module):
-    def __init__(self, gas_grav_model, N_MGE_components: int, n_grid, surf_grid, distance, r_min, r_max, soft, device, dtype, quad_points=128):
-        super().__init__("Sersic_Gas")
-        self.gas_grav = gas_grav_model
-        self.scale = gas_grav_model.scale
-        self.m_gas = gas_grav_model.m_gas
-        
-        self.N_components = N_MGE_components
-        self.soft = soft
-        self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
-        self.n_grid = n_grid
-        self.surf_grid = surf_grid
-        self.surf=torch.zeros(self.N_components, device=device, dtype=dtype)
-
-        inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
-        outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
-        low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
-        high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
-        dx=(high_Gauss-low_Gauss)/self.N_components
-        
-        # --- SOLUTION ---
-        # Ensure all scalars are tensors of the correct dtype before the calculation
-        distance_t = torch.tensor(distance, device=device, dtype=dtype)
-        pi_t = torch.tensor(np.pi, device=device, dtype=dtype)
-        
-        self.sigma = (distance_t * (pi_t / 0.648)) * 10**(low_Gauss + (0.5 + torch.arange(self.N_components, device=device, dtype=dtype)) * dx)
-        
-        self.inc   = Param("inc",   shape=())
-        self.qintr = Param("qintr", shape=())
-        self.qintr_shaper = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.m_bh  = Param("m_bh",  shape=())
-        self.MGE.inc = self.inc
-        self.MGE.m_bh = self.m_bh
-
-        self.n = Param("n", shape=(1, ))
-        self.r_e = Param("r_e", shape = ())
-        self.I_e = Param("intensity_r_e", shape = ())
-        self.dtype = dtype
-
-    @forward
-    def velocity(self, R_flat,
-                 m_gas = None, scale = None,
-                 inc=None, qintr=None, m_bh=None,
-                 n = None, r_e = None, I_e = None,
-                 G=0.004301):
-        device = R_flat.device
-        dtype  = R_flat.dtype
-
-        for i in range(self.N_components):
-            self.surf[i]=interp1d(self.n_grid,self.surf_grid[:,i],n,extend="extrapolate")
-        
-        MGE_surf = self.surf*10**I_e
-        MGE_sigma = self.sigma*r_e
-        v_stars_BH = self.MGE.velocity(R_map = R_flat, surf = MGE_surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
-        
-        v_gas = self.gas_grav.velocity(R_flat, m_gas = m_gas, scale = scale)
-        
-        v_rot = torch.sqrt(v_stars_BH**2 + v_gas**2) 
-        return v_rot
-
-class Nuker_Gas(Module):
-    def __init__(self, gas_grav_model, N_MGE_components: int, Nuker_NN, NN_dtype, distance, r_min, r_max, soft, device, dtype, quad_points=128):
-        super().__init__("Nuker_Gas")
-        self.gas_grav = gas_grav_model
-        self.scale = gas_grav_model.scale
-        self.m_gas = gas_grav_model.m_gas
-        
-        self.N_components = N_MGE_components
-        self.soft = soft
-        self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
-        self.NN = Nuker_NN
-
-        inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
-        outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
-        low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
-        high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
-        dx=(high_Gauss-low_Gauss)/self.N_components
-        
-        # --- SOLUTION ---
-        # Ensure all scalars are tensors of the correct dtype before the calculation
-        distance_t = torch.tensor(distance, device=device, dtype=dtype)
-        pi_t = torch.tensor(np.pi, device=device, dtype=dtype)
-        
-        self.sigma = (distance_t * (pi_t / 0.648)) * 10**(low_Gauss + (0.5 + torch.arange(self.N_components, device=device, dtype=dtype)) * dx)
-
-        self.inc   = Param("inc",   shape=())
-        self.qintr = Param("qintr", shape=())
-        self.qintr_shaper = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.m_bh  = Param("m_bh",  shape=())
-        self.MGE.inc = self.inc
-        self.MGE.m_bh = self.m_bh
-
-        self.alpha = Param("alpha", shape=(1, ))
-        self.gmb = Param("gamma_minus_beta", shape=(1, ))
-        self.gamma = Param("gamma", shape=(1, ))
-        self.r_b = Param("break_r", shape = ())
-        self.I_b = Param("intensity_r_b", shape = ())
-        self.dtype = dtype
-        self.NN_dtype = NN_dtype
-    
-    def symexp(self, y, linthresh=1e-12, base=10.0):
-        # --- SOLUTION ---
-        # Create tensor constants that match the input tensor's properties
-        linthresh_t = torch.tensor(linthresh, device=y.device, dtype=y.dtype)
-        base_t = torch.tensor(base, device=y.device, dtype=y.dtype)
-        one_t = torch.tensor(1.0, device=y.device, dtype=y.dtype)
-    
-        return torch.sign(y) * linthresh_t * (base_t**torch.abs(y) - one_t)
-
-    @forward
-    def velocity(self, R_flat,
-                 m_gas = None, scale = None, 
-                 inc=None, qintr=None, m_bh=None,
-                 alpha = None, gmb = None, gamma = None, r_b = None, I_b = None,
-                 G=0.004301):
-        device = R_flat.device
-        dtype  = R_flat.dtype
-        beta = gamma - gmb
-
-        NN_input = torch.cat([alpha, beta, gamma])#.to(self.NN_dtype)
-        NN_output_transformed = self.NN.forward(NN_input)#.to(self.dtype)
-        NN_output = self.symexp(NN_output_transformed)
-        
-        surf = NN_output*10**I_b
-        MGE_sigma = self.sigma*r_b
-        v_stars_BH = self.MGE.velocity(R_map = R_flat, surf = surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
-
-        v_gas = self.gas_grav.velocity(R_flat, m_gas = m_gas, scale = scale)
-
-        v_rot = torch.sqrt(v_stars_BH**2 + v_gas**2) 
-        return v_rot
-
-
-class NukerMGEFull(Module):
-    def __init__(self, N_MGE_components: int, Nuker_NN, NN_dtype, distance, soft, device, dtype, scaler_path, quad_points=128):
-        """
-        A velocity model that uses a trained neural network to map Nuker
-        parameters to an MGE representation. This class takes a trained NukerMGEProfileModel as input.
-
-        Args:
-            trained_nn_model (MGEProfileModel): The fully trained neural network model
-                that predicts MGE profiles.
-            scaler_path (str): The file path to the saved 'StandardScaler'
-                (.joblib file) used during training.
-            device: The PyTorch device (e.g., 'cuda' or 'cpu').
-            dtype: The PyTorch data type (e.g., torch.float32).
-            mge_velocity_calculator (MGEVelocityIntr): A pre-initialized module
-                that calculates velocities from MGE components.
-        """
-        super().__init__("NukerMGEFull")
-
-        self.N_components = N_MGE_components
-        self.soft = soft
-        # pc / arcsec conversion (distance in Mpc)
-        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
-        c_t    = torch.tensor(0.648, device=device, dtype=dtype)  # so that pi/0.648 ≈ 4.848
-        self.distance_Mpc   = torch.tensor(distance, device=device, dtype=dtype)
-        self.pc_per_arcsec  = self.distance_Mpc * (pi_t / c_t)    # ≈ 4.848 * D_Mpc
-        # Small epsilon for safe logs
-        self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
-        
-        self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
-        self.NN = Nuker_NN
-        
-        # --- 2. Load the Scaler and create autodifferentiable buffers ---
-        try:
-            scaler = joblib.load(scaler_path)
-            # Convert scaler's mean and scale to PyTorch tensors
-            self.scaler_mean = torch.tensor(scaler.mean_, device=device, dtype=dtype)
-            self.scaler_scale = torch.tensor(scaler.scale_, device=device, dtype=dtype)
-            
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Scaler file not found at '{scaler_path}'. "
-                "This file is required to transform inputs for the neural network."
-            )
-        
-        # --- 4. Define the fittable parameters using Caskade's syntax ---
-        # These are the physical parameters of the galaxy model
-        self.inc   = Param("inc",   shape=())
-        self.qintr = Param("qintr", shape=())
-        self.m_bh  = Param("m_bh",  shape=())
-        
-        # These are the four Nuker parameters that will be fed into the NN
-        self.alpha   = Param("alpha",   shape=(1, ))
-        self.gmb = Param("gamma_minus_beta", shape=(1, ))
-        self.gamma   = Param("gamma",   shape=(1, ))
-        self.r_b = Param("r_b", shape=(1, ))
-        self.I_b = Param("intensity_r_b", shape = ())
-
-        # --- 5. Set up other necessary attributes ---
-        # Get the number of components from the trained NN model
-        self.N_components = self.NN.n_gauss_model
-        self.qintr_shaper = torch.ones((self.N_components), device=device, dtype=dtype)
-        
-        # Link parameters to the MGE velocity calculator
-        self.MGE.inc = self.inc
-        self.MGE.m_bh = self.m_bh
-
-    @forward
-    def velocity(self, R_flat,
-                 inc=None, qintr=None, m_bh=None,
-                 alpha = None, gmb = None, gamma = None, r_b = None, I_b = None,
-                 G=0.004301):
-        """
-        Calculates the velocity curve.
-        """
-        # --- Step 1: Assemble the Nuker parameters for the NN ---
-        # The NN expects a tensor of shape (batch_size, 4).
-        # We unsqueeze to create a batch dimension of 1.
-        beta = gamma - gmb
-        r_b_pc = torch.clamp(r_b * self.pc_per_arcsec, min=self._eps)
-        log10_r_b_pc = torch.log10(r_b_pc)
-        NN_input = torch.cat([
-            alpha,
-            beta,
-            gamma,
-            log10_r_b_pc
-        ]).unsqueeze(0) # Transpose to get shape (1, 4)
-
-        # --- Step 2: Apply the scaler transformation (autodifferentiable) ---
-        # This operation is now part of the PyTorch computation graph.
-        NN_input_scaled = (NN_input - self.scaler_mean) / self.scaler_scale
-
-        # --- Step 3: Get MGE parameters from the trained neural network ---
-        # The NN_model's internal get_mge_params handles the symexp transform.
-        # It returns surf and sigma with shape (1, n_gauss). We squeeze them.
-        surf, sigma = self.NN.get_mge_params(NN_input_scaled)
-        surf = surf.squeeze(0)
-        sigma = sigma.squeeze(0)
-        
-        # --- Step 4: Calculate the velocity using the predicted MGE ---
-        v_rot = self.MGE.velocity(
-            R_map=R_flat, 
-            surf=surf*10**I_b, 
-            sigma=sigma, 
-            qintr=qintr * self.qintr_shaper
-        )
-        
-        return v_rot
-
-class NukerMGEProfileModel(nn.Module):
-    """
-    A neural network-based model that predicts the MGE mass profile from Nuker parameters. Use this class to train the neural network and load it into NukerMGEFull!
-    """
-    def __init__(self, n_gauss_model, n_radii_data=100, r_min=1, r_max=10000, 
-                 linthresh=1e-5, base=10.0):
-        """
-        Initializes the model and the fixed sigma grid.
-        Args:
-            n_gauss_model (int): The number of Gaussian components.
-            n_radii_data (int): The number of radial bins for the profile.
-            r_min (float): The minimum radius (in pc) for the sigma grid calculation.
-            r_max (float): The maximum radius (in pc) for the sigma grid calculation.
-            linthresh (float): The threshold for the linear region of symexp/symlog.
-            base (float): The base for the exponential/logarithmic part of the transform.
-        """
-        super(NukerMGEProfileModel, self).__init__()
-        self.n_gauss_model = n_gauss_model
-        self.nuker_to_mge_net = NukerToMGE_NN(n_gauss=self.n_gauss_model)
-        
-        # Store symexp parameters
-        self.linthresh = linthresh # <--- NEW
-        self.base = base         # <--- NEW
-
-        r_space_basis = np.geomspace(r_min, r_max, n_radii_data)
-        low_Gauss = np.log10(np.min(r_space_basis) / np.sqrt(3.0))
-        high_Gauss = np.log10(np.max(r_space_basis) / np.sqrt(3.0))
-        dx = (high_Gauss - low_Gauss) / self.n_gauss_model
-        sigma_grid_np = 10**(low_Gauss + (0.5 + np.arange(self.n_gauss_model)) * dx)
-        
-        self.register_buffer('sigma_grid', torch.tensor(sigma_grid_np, dtype=torch.float32))
-
-    def symexp(self, y): # <--- NEW: Symexp transformation method
-        """ Symmetrical exponential function. Inverse of symlog. """
-        linthresh_t = torch.tensor(self.linthresh, device=y.device, dtype=y.dtype)
-        base_t = torch.tensor(self.base, device=y.device, dtype=y.dtype)
-        one_t = torch.tensor(1.0, device=y.device, dtype=y.dtype)
-    
-        return torch.sign(y) * linthresh_t * (base_t**torch.abs(y) - one_t)
-
-    def symlog(self, x): # <--- NEW: Symlog for analysis (not used in training)
-        """ Symmetrical logarithmic function. Inverse of symexp. """
-        linthresh_t = torch.tensor(self.linthresh, device=x.device, dtype=x.dtype)
-        base_t = torch.tensor(self.base, device=x.device, dtype=x.dtype)
-        one_t = torch.tensor(1.0, device=x.device, dtype=x.dtype)
-
-        return torch.sign(x) * torch.log10(torch.abs(x) / linthresh_t + one_t)
-
-    def get_mge_params(self, nuker_params):
-        """
-        Exposes the MGE parameters after applying the symexp transform.
-        """
-        # The core NN now predicts the *compressed* surf values
-        compressed_surfs = self.nuker_to_mge_net(nuker_params) # <--- CHANGED
-        
-        # Apply the symexp transform to get the true, high-dynamic-range surf values
-        predicted_surfs = self.symexp(compressed_surfs) # <--- CHANGED
-        
-        return predicted_surfs, self.sigma_grid
-
-    def forward(self, nuker_params, r_space_eval):
-        """
-        Predicts the MGE mass profile. This function does not need to change.
-        """
-        # This method automatically uses the new get_mge_params method
-        predicted_surfs, sigmas = self.get_mge_params(nuker_params)
-        
-        r_squared = r_space_eval.view(1, 1, -1)**2
-        sigmas_squared = (2 * sigmas.view(1, -1, 1)**2)
-        
-        gaussians = torch.exp(-r_squared / sigmas_squared)
-        mass_profile = torch.sum(predicted_surfs.unsqueeze(2) * gaussians, dim=1)
-        return mass_profile
-
-class NukerToMGE_NN(nn.Module):
-    """
-    A neural network that maps Nuker parameters to MGE surface brightness normalizations.
-    """
-    def __init__(self, n_gauss=64):
-        """
-        Initializes the network architecture.
-        Args:
-            n_gauss (int): The number of Gaussian components in the MGE model.
-        """
-        super(NukerToMGE_NN, self).__init__()
-        
-        # This sequential model forms the core of the network, learning the
-        # complex relationship between Nuker parameters and MGE normalizations.
-        self.layers = nn.Sequential(
-            # Input layer expects 4 features: alpha, beta, gamma, log_r_b
-            nn.Linear(4, 128),
-            nn.SELU(),
-            nn.Linear(128, 256),
-            nn.SELU(),
-            nn.Linear(256, 512),
-            nn.SELU(),
-            nn.Linear(512, 256),
-            nn.SELU(),
-            nn.Linear(256, 128),
-            nn.SELU(),
-            # Output layer produces n_gauss values, corresponding to the MGE surfs.
-            nn.Linear(128, n_gauss)
-        )
-
-    def forward(self, x):
-        """
-        Performs the forward pass.
-        Args:
-            x (torch.Tensor): A tensor of shape (batch_size, 4) containing the
-                              Nuker parameters.
-        Returns:
-            torch.Tensor: A tensor of shape (batch_size, n_gauss) representing
-                          the predicted MGE surf values.
-        """
-        return self.layers(x)
-
-
+                
 # -----------------------------
 # Helper: precomputed ridge projector for MGE coefficients
 # -----------------------------
+
 class PrecomputedMGEProjector(torch.nn.Module):
     """
-    Fixed basis A_ij = exp(-R_i^2 / (2 sigma_j^2))  (no normalization, matching your NN forward)
+    Fixed basis A_ij = exp(-R_i^2 / (2 sigma_j^2))
     Precompute ridge projector:
-        P = (A^T A + lam I)^-1 A^T    so surf = P @ y
+        P = (A^T A + lam I)^-1 A^T
+    so surf = P @ y
     """
     def __init__(
         self,
         *,
-        r_grid_pc: torch.Tensor,     # (R,)
-        sigma_grid_pc: torch.Tensor, # (K,)
+        r_grid_pc: torch.Tensor,
+        sigma_grid_pc: torch.Tensor,
         lam_base: float = 1e-6,
         max_jitter_tries: int = 12,
         dtype: torch.dtype = torch.float32,
@@ -747,15 +310,13 @@ class PrecomputedMGEProjector(torch.nn.Module):
         self.register_buffer("r_grid", r_grid_pc.to(device=device, dtype=dtype))
         self.register_buffer("sigma_grid", sigma_grid_pc.to(device=device, dtype=dtype))
 
-        # Build A in float32 for runtime usage
         r = self.r_grid
         sig = self.sigma_grid
         A = torch.exp(-(r[:, None] ** 2) / (2.0 * sig[None, :] ** 2))  # (R,K)
         self.register_buffer("A", A)
 
-        # Precompute P in float64 for robustness, then cast back
         A64 = A.to(torch.float64)
-        R, K = A64.shape
+        _, K = A64.shape
         AtA64 = A64.T @ A64
         I64 = torch.eye(K, device=device, dtype=torch.float64)
 
@@ -771,125 +332,77 @@ class PrecomputedMGEProjector(torch.nn.Module):
 
         if L is None:
             raise RuntimeError(
-                "Failed to Cholesky-factor (A^T A + λI) even after jitter escalation. "
+                "Failed to Cholesky-factor (A^T A + λI). "
                 "Try increasing lam_base or reducing K."
             )
 
         P64 = torch.cholesky_solve(A64.T, L)  # (K,R)
-        P = P64.to(dtype=dtype)
-        self.register_buffer("P", P)          # (K,R)
-        self.lam_used = lam                  # python float, for debugging
+        self.register_buffer("P", P64.to(dtype=dtype))
+        self.lam_used = lam
 
     def surf_from_profile(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        y: (R,) or (B,R)
-        returns surf: (K,) or (B,K)
-        """
         if y.ndim == 1:
             return self.P @ y
         elif y.ndim == 2:
-            # (B,R) -> (B,K) via y @ P^T
             return y @ self.P.T
-        else:
-            raise ValueError(f"y must be 1D or 2D, got shape {tuple(y.shape)}")
+        raise ValueError(f"y must be 1D or 2D, got {tuple(y.shape)}")
 
     def profile_from_surf(self, surf: torch.Tensor) -> torch.Tensor:
-        """
-        surf: (K,) or (B,K)
-        returns yhat: (R,) or (B,R)
-        """
         if surf.ndim == 1:
             return self.A @ surf
         elif surf.ndim == 2:
             return surf @ self.A.T
-        else:
-            raise ValueError(f"surf must be 1D or 2D, got shape {tuple(surf.shape)}")
+        raise ValueError(f"surf must be 1D or 2D, got {tuple(surf.shape)}")
+
 
 
 # -----------------------------
-# Sérsic -> profile on r_grid (Torch)
+# Shared base
 # -----------------------------
-def sersic_profile_torch_1d(R, I_e, R_e, n, eps=1e-30):
-    """
-    Standard Sérsic profile:
-        I(R) = I_e * exp[-b_n * ((R / R_e)^(1/n) - 1)]
-
-    Parameters
-    ----------
-    R   : (R,) tensor
-        Radius grid in pc.
-    I_e : scalar tensor
-        Intensity at effective radius.
-    R_e : scalar tensor
-        Effective radius in pc.
-    n   : scalar tensor
-        Sérsic index.
-    """
-    R   = torch.clamp(R,   min=eps)
-    R_e = torch.clamp(R_e, min=eps)
-    n   = torch.clamp(n,   min=eps)
-
-    # Standard approximation for b_n
-    b_n = 2.0*n - (1.0/3.0) + 4.0/(405.0*n) + 46.0/(25515.0*n*n)
-
-    return I_e * torch.exp(-b_n * (torch.pow(R / R_e, 1.0 / n) - 1.0))
-
-
-class SersicMGEFull_PreLS(Module):
-    """
-    Sérsic params -> profile on fixed radius grid -> PreLS MGE coefficients -> velocity
-
-    This replaces interpolation over a precomputed n-grid with an on-the-fly
-    least-squares projection onto a fixed Gaussian sigma basis.
-    """
+class _PreLSMGEBase(Module):
     def __init__(
         self,
+        name: str,
         N_MGE_components: int,
         *,
         distance_Mpc: float,
         soft: float,
         device,
         dtype,
-        # MGE/profile grid config
         n_radii_data: int = 100,
         r_min_pc: float = 1.0,
         r_max_pc: float = 1e4,
-        # ridge regularization
         lam_base: float = 1e-6,
         max_jitter_tries: int = 12,
-        # velocity module config
         quad_points: int = 128,
         radius_res: int = 4096,
         G: float = 0.004301,
     ):
-        super().__init__("SersicMGEFull_PreLS")
+        super().__init__(name)
         self.device = device
-        self.dtype  = dtype
+        self.dtype = dtype
+        self.N_MGE_components = N_MGE_components
 
-        # pc / arcsec conversion (distance in Mpc)
-        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
-        c_t    = torch.tensor(0.648, device=device, dtype=dtype)  # pi/0.648 ≈ 4.848
-        self.distance_Mpc  = torch.tensor(distance_Mpc, device=device, dtype=dtype)
+        pi_t = torch.tensor(math.pi, device=device, dtype=dtype)
+        c_t = torch.tensor(0.648, device=device, dtype=dtype)  # pi/0.648 ≈ 4.848
+        self.distance_Mpc = torch.tensor(distance_Mpc, device=device, dtype=dtype)
         self.pc_per_arcsec = self.distance_Mpc * (pi_t / c_t)
 
         self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
-        self.G    = torch.tensor(G, device=device, dtype=dtype)
+        self.G = torch.tensor(G, device=device, dtype=dtype)
 
-        # Fixed radius grid in pc
         r_grid = torch.tensor(
             np.geomspace(r_min_pc, r_max_pc, n_radii_data),
             device=device,
             dtype=dtype,
         )
 
-        # Fixed sigma grid in pc, matching your existing scheme
         low_G = np.log10(np.min(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
         high_G = np.log10(np.max(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
         dx = (high_G - low_G) / N_MGE_components
         sigma_grid_np = 10 ** (low_G + (0.5 + np.arange(N_MGE_components)) * dx)
         sigma_grid = torch.tensor(sigma_grid_np, device=device, dtype=dtype)
 
-        # Precomputed projector
         self.projector = PrecomputedMGEProjector(
             r_grid_pc=r_grid,
             sigma_grid_pc=sigma_grid,
@@ -899,7 +412,6 @@ class SersicMGEFull_PreLS(Module):
             device=device,
         )
 
-        # Velocity calculator
         self.MGE = MGEVelocityIntr(
             N_components=N_MGE_components,
             device=device,
@@ -909,69 +421,49 @@ class SersicMGEFull_PreLS(Module):
             soft=soft,
             G=G,
         )
-        self.MGE.surf.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
-        self.MGE.sigma.to_static(self.projector.sigma_grid.clone())
-        self.MGE.qintr.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
-        self.MGE.M_to_L.to_static(torch.tensor(1.0, device=device, dtype=dtype))
 
-        # Galaxy params
-        self.inc   = Param("inc",   shape=())
+        # galaxy params
+        self.inc = Param("inc", shape=())
         self.qintr = Param("qintr", shape=())
-        self.m_bh  = Param("m_bh",  shape=())
+        self.m_bh = Param("m_bh", shape=())
 
-        self.MGE.inc  = self.inc
+        self.MGE.inc = self.inc
         self.MGE.m_bh = self.m_bh
 
-        # Sérsic params
-        self.n   = Param("n",   shape=(1,))
-        self.r_e = Param("r_e", shape=())   # arcsec
-        self.I_e = Param("intensity_r_e", shape=())  # log10(I_e)
+        # sigma basis is fixed
+        self.MGE.sigma.to_static(self.projector.sigma_grid.clone())
 
-        self.qintr_shaper = torch.ones((N_MGE_components,), device=device, dtype=dtype)
+        #Mass to Light is now controlled by intensity normalization of profile
+        self.MGE.M_to_L.to_static(torch.ones((1,), device=self.device, dtype=self.dtype))
 
-    @forward
-    def velocity(
-        self,
-        R_flat,
-        inc=None, qintr=None, m_bh=None,
-        n=None, r_e=None, I_e=None,
-    ):
-        # arcsec -> pc
-        r_e_pc = torch.clamp(r_e * self.pc_per_arcsec, min=self._eps)
+        # qintr becomes a functional pointer: scalar -> per-Gaussian vector
+        self.MGE.qintr = self._qintr_pointer
+        self.MGE.qintr.link([self.qintr])
 
-        # log10(I_e) -> linear
-        I_e_lin = torch.pow(torch.tensor(10.0, device=self.device, dtype=self.dtype), I_e)
+    def _ten(self):
+        return torch.tensor(10.0, device=self.device, dtype=self.dtype)
 
-        # Evaluate Sérsic profile on fixed radius grid
-        y = sersic_profile_torch_1d(
-            self.projector.r_grid,
-            I_e_lin,
-            r_e_pc.squeeze() if r_e_pc.ndim > 0 else r_e_pc,
-            n.squeeze(),
-            eps=float(self._eps.item()),
-        )  # (R,)
-
-        # Project to MGE coefficients
-        surf = self.projector.surf_from_profile(y)   # (K,)
-        sigma = self.projector.sigma_grid            # (K,)
-
-        # Velocity
-        v_rot = self.MGE.velocity(
-            R_map=R_flat,
-            surf=surf,
-            sigma=sigma,
-            qintr=qintr * self.qintr_shaper,
+    def _qintr_pointer(self, p):
+        return p.qintr.value * torch.ones(
+            (self.N_MGE_components,),
+            device=self.device,
+            dtype=self.dtype,
         )
-        return v_rot
 
 
 # -----------------------------
-# Nuker -> profile on r_grid (Torch)
+# Profile helpers
 # -----------------------------
+def sersic_profile_torch_1d(R, I_e, R_e, n, eps=1e-30):
+    R   = torch.clamp(R,   min=eps)
+    R_e = torch.clamp(R_e, min=eps)
+    n   = torch.clamp(n,   min=eps)
+
+    b_n = 2.0 * n - (1.0 / 3.0) + 4.0 / (405.0 * n) + 46.0 / (25515.0 * n * n)
+    return I_e * torch.exp(-b_n * (torch.pow(R / R_e, 1.0 / n) - 1.0))
+
+
 def nuker_profile_torch_1d(R, I_b, r_b, alpha, beta, gamma, eps=1e-30):
-    """
-    All inputs scalar tensors; R is (R,)
-    """
     R = torch.clamp(R, min=eps)
     r_b = torch.clamp(r_b, min=eps)
     alpha = torch.clamp(alpha, min=eps)
@@ -981,41 +473,30 @@ def nuker_profile_torch_1d(R, I_b, r_b, alpha, beta, gamma, eps=1e-30):
     pref = I_b * torch.pow(two, (beta - gamma) / alpha)
     core = torch.pow(x, -gamma)
     outer = torch.pow(1.0 + torch.pow(x, alpha), (gamma - beta) / alpha)
-    return pref * core * outer  # (R,)
+    return pref * core * outer
 
 
-# -----------------------------
-# Core-Sérsic -> profile on r_grid (Torch)
-# -----------------------------
 def core_sersic_torch_1d(R, I_b, R_b, R_e, alpha, gamma, n, eps=1e-30):
-    """
-    All inputs scalar tensors; R is (R,)
-    """
     R   = torch.clamp(R,   min=eps)
     R_b = torch.clamp(R_b, min=eps)
     R_e = torch.clamp(R_e, min=eps)
     alpha = torch.clamp(alpha, min=eps)
     n     = torch.clamp(n, min=eps)
 
-    # b_n approximation
-    b_n = 2.0*n - (1.0/3.0) + 4.0/(405.0*n) + 46.0/(25515.0*n*n)
+    b_n = 2.0 * n - (1.0 / 3.0) + 4.0 / (405.0 * n) + 46.0 / (25515.0 * n * n)
 
     term1 = torch.pow(1.0 + torch.pow(R_b / R, alpha), gamma / alpha)
-
     inside = (torch.pow(R, alpha) + torch.pow(R_b, alpha)) / torch.pow(R_e, alpha)
-    term2 = torch.exp(-b_n * (torch.pow(inside, 1.0/(alpha*n)) - 1.0))
+    term2 = torch.exp(-b_n * (torch.pow(inside, 1.0 / (alpha * n)) - 1.0))
+    return I_b * term1 * term2
 
-    return I_b * term1 * term2  # (R,)
 
-
-# ============================================================================
-# Full models in the style of NukerMGEFull, but using Precomputed LS projectors
-# ============================================================================
-
-class NukerMGEFull_PreLS(Module):
+# -----------------------------
+# Sérsic
+# -----------------------------
+class SersicMGE(_PreLSMGEBase):
     """
-    Mirrors NukerMGEFull architecture, but uses precomputed LS:
-      Nuker params -> profile y(R_grid) -> surf = P@y -> MGE velocity
+    Sérsic params -> profile -> functional-pointer surf -> MGE velocity
     """
     def __init__(
         self,
@@ -1025,313 +506,292 @@ class NukerMGEFull_PreLS(Module):
         soft: float,
         device,
         dtype,
-        # MGE grid config
         n_radii_data: int = 100,
         r_min_pc: float = 1.0,
         r_max_pc: float = 1e4,
-        # LS regularization
         lam_base: float = 1e-6,
         max_jitter_tries: int = 12,
-        # velocity module config
         quad_points: int = 128,
         radius_res: int = 4096,
-        G: float = 0.004301
+        G: float = 0.004301,
     ):
-        super().__init__("NukerMGEFull_PreLS")
-        self.device = device
-        self.dtype  = dtype
-
-        # pc / arcsec conversion (distance in Mpc)
-        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
-        c_t    = torch.tensor(0.648, device=device, dtype=dtype)  # pi/0.648 ≈ 4.848
-        self.distance_Mpc  = torch.tensor(distance_Mpc, device=device, dtype=dtype)
-        self.pc_per_arcsec = self.distance_Mpc * (pi_t / c_t)
-
-        self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
-        self.G = torch.tensor(G, device=device, dtype=dtype)
-
-        # Fixed radius grid used for LS fit
-        r_grid = torch.tensor(np.geomspace(r_min_pc, r_max_pc, n_radii_data),
-                              device=device, dtype=dtype)
-
-        # Fixed sigma grid (exactly the scheme from your NN model)
-        low_G = np.log10(np.min(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
-        high_G = np.log10(np.max(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
-        dx = (high_G - low_G) / N_MGE_components
-        sigma_grid_np = 10**(low_G + (0.5 + np.arange(N_MGE_components))*dx)
-        sigma_grid = torch.tensor(sigma_grid_np, device=device, dtype=dtype)
-
-        # Precomputed projector (constant buffers)
-        self.projector = PrecomputedMGEProjector(
-            r_grid_pc=r_grid,
-            sigma_grid_pc=sigma_grid,
-            lam_base=lam_base,
-            max_jitter_tries=max_jitter_tries,
-            dtype=dtype,
-            device=device
-        )
-
-        # MGE velocity calculator
-        self.MGE = MGEVelocityIntr(
-            N_components=N_MGE_components,
+        super().__init__(
+            "SersicMGE",
+            N_MGE_components,
+            distance_Mpc=distance_Mpc,
+            soft=soft,
             device=device,
             dtype=dtype,
+            n_radii_data=n_radii_data,
+            r_min_pc=r_min_pc,
+            r_max_pc=r_max_pc,
+            lam_base=lam_base,
+            max_jitter_tries=max_jitter_tries,
             quad_points=quad_points,
             radius_res=radius_res,
-            soft=soft,
             G=G,
         )
-        self.MGE.surf.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
-        self.MGE.sigma.to_static(self.projector.sigma_grid.clone())
-        self.MGE.qintr.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
-        self.MGE.M_to_L.to_static(torch.tensor(1.0, device=device, dtype=dtype))
 
-        # Link galaxy parameters (same pattern as your NukerMGEFull)
-        self.inc   = Param("inc",   shape=())
-        self.qintr = Param("qintr", shape=())
-        self.m_bh  = Param("m_bh",  shape=())
+        self.n = Param("n", shape=(1,))
+        self.r_e = Param("r_e", shape=())           # arcsec
+        self.I_e = Param("intensity_r_e", shape=()) # log10(I_e)
 
-        self.MGE.inc  = self.inc
-        self.MGE.m_bh = self.m_bh
+        self.MGE.surf = self._surf_pointer
+        self.MGE.surf.link([self.n, self.r_e, self.I_e])
 
-        # These are the four Nuker parameters (same naming you used)
-        self.alpha = Param("alpha", shape=(1,))
-        self.gmb   = Param("gamma_minus_beta", shape=(1,))  # gmb = gamma - beta
-        self.gamma = Param("gamma", shape=(1,))
-        self.r_b   = Param("r_b", shape=(1,))               # break radius (arcsec)
-        self.I_b   = Param("intensity_r_b", shape=())       # log10(I_b) in your usage
+    def _surf_pointer(self, p):
+        r_e_pc = torch.clamp(p.r_e.value * self.pc_per_arcsec, min=self._eps)
+        I_e_lin = torch.pow(self._ten(), p.intensity_r_e.value)
 
-        # broadcast helper for qintr per component
-        self.qintr_shaper = torch.ones((N_MGE_components,), device=device, dtype=dtype)
+        y = sersic_profile_torch_1d(
+            self.projector.r_grid,
+            I_e_lin,
+            r_e_pc.squeeze() if r_e_pc.ndim > 0 else r_e_pc,
+            p.n.value.squeeze(),
+            eps=float(self._eps.item()),
+        )
+        return self.projector.surf_from_profile(y)
 
     @forward
-    def velocity(
+    def velocity(self, R_flat, inc=None, qintr=None, m_bh=None, n=None, r_e=None, I_e=None):
+        return self.MGE.velocity(R_map=R_flat)
+
+
+# -----------------------------
+# Nuker
+# -----------------------------
+class NukerMGE(_PreLSMGEBase):
+    """
+    Nuker params -> profile -> functional-pointer surf -> MGE velocity
+    """
+    def __init__(
         self,
-        R_flat,                         # 2-D tensor [H,W] in pc (as in your MGEVelocityIntr usage)
-        inc=None, qintr=None, m_bh=None,
-        alpha=None, gmb=None, gamma=None, r_b=None, I_b=None,
+        N_MGE_components: int,
+        *,
+        distance_Mpc: float,
+        soft: float,
+        device,
+        dtype,
+        n_radii_data: int = 100,
+        r_min_pc: float = 1.0,
+        r_max_pc: float = 1e4,
+        lam_base: float = 1e-6,
+        max_jitter_tries: int = 12,
+        quad_points: int = 128,
+        radius_res: int = 4096,
+        G: float = 0.004301,
     ):
-        # Convert Nuker params to profile params
-        beta = gamma - gmb  # matches your NukerMGEFull convention
+        super().__init__(
+            "NukerMGE",
+            N_MGE_components,
+            distance_Mpc=distance_Mpc,
+            soft=soft,
+            device=device,
+            dtype=dtype,
+            n_radii_data=n_radii_data,
+            r_min_pc=r_min_pc,
+            r_max_pc=r_max_pc,
+            lam_base=lam_base,
+            max_jitter_tries=max_jitter_tries,
+            quad_points=quad_points,
+            radius_res=radius_res,
+            G=G,
+        )
 
-        # r_b is in arcsec -> pc
-        r_b_pc = torch.clamp(r_b * self.pc_per_arcsec, min=self._eps)
-        I_b_lin = torch.pow(torch.tensor(10.0, device=self.device, dtype=self.dtype), I_b)
+        self.alpha = Param("alpha", shape=(1,))
+        self.gmb = Param("gamma_minus_beta", shape=(1,))
+        self.gamma = Param("gamma", shape=(1,))
+        self.r_b = Param("r_b", shape=(1,))              # arcsec
+        self.I_b = Param("intensity_r_b", shape=())      # log10(I_b)
 
-        # Evaluate Nuker profile on projector radius grid
+        self.MGE.surf = self._surf_pointer
+        self.MGE.surf.link([self.alpha, self.gmb, self.gamma, self.r_b, self.I_b])
+
+    def _surf_pointer(self, p):
+        gamma = p.gamma.value.squeeze()
+        gmb = p.gamma_minus_beta.value.squeeze()
+        beta = gamma - gmb
+    
+        r_b_pc = torch.clamp(p.r_b.value * self.pc_per_arcsec, min=self._eps)
+        I_b_lin = torch.pow(self._ten(), p.intensity_r_b.value)
+    
         y = nuker_profile_torch_1d(
             self.projector.r_grid,
             I_b_lin,
             r_b_pc.squeeze(),
-            alpha.squeeze(),
-            beta.squeeze(),
-            gamma.squeeze(),
+            p.alpha.value.squeeze(),
+            beta,
+            gamma,
             eps=float(self._eps.item()),
-        )  # (R,)
-
-        # LS: surf = P @ y
-        surf = self.projector.surf_from_profile(y)      # (K,)
-        sigma = self.projector.sigma_grid               # (K,)
-
-        # Compute velocity
-        v_rot = self.MGE.velocity(
-            R_map=R_flat,
-            surf=surf,
-            sigma=sigma,
-            qintr=qintr * self.qintr_shaper
         )
-        return v_rot
-
-
-class CoreSersicMGEFull_PreLS(Module):
-    """
-    Same architecture idea, but Core-Sérsic parameters -> profile -> surf via precomputed LS.
-    """
-    def __init__(
-        self,
-        N_MGE_components: int,
-        *,
-        distance_Mpc: float,
-        soft: float,
-        device,
-        dtype,
-        # grids
-        n_radii_data: int = 100,
-        r_min_pc: float = 1.0,
-        r_max_pc: float = 1e4,
-        # LS regularization
-        lam_base: float = 1e-6,
-        max_jitter_tries: int = 12,
-        # velocity module
-        quad_points: int = 128,
-        radius_res: int = 4096,
-        G: float = 0.004301
-    ):
-        super().__init__("CoreSersicMGEFull_PreLS")
-        self.device = device
-        self.dtype  = dtype
-
-        pi_t   = torch.tensor(math.pi, device=device, dtype=dtype)
-        c_t    = torch.tensor(0.648, device=device, dtype=dtype)
-        self.distance_Mpc  = torch.tensor(distance_Mpc, device=device, dtype=dtype)
-        self.pc_per_arcsec = self.distance_Mpc * (pi_t / c_t)
-
-        self._eps = torch.tensor(1e-20, device=device, dtype=dtype)
-        self.G = torch.tensor(G, device=device, dtype=dtype)
-
-        r_grid = torch.tensor(np.geomspace(r_min_pc, r_max_pc, n_radii_data),
-                              device=device, dtype=dtype)
-
-        # sigma grid (same scheme)
-        low_G = np.log10(np.min(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
-        high_G = np.log10(np.max(r_grid.detach().cpu().numpy()) / np.sqrt(3.0))
-        dx = (high_G - low_G) / N_MGE_components
-        sigma_grid_np = 10**(low_G + (0.5 + np.arange(N_MGE_components))*dx)
-        sigma_grid = torch.tensor(sigma_grid_np, device=device, dtype=dtype)
-
-        self.projector = PrecomputedMGEProjector(
-            r_grid_pc=r_grid,
-            sigma_grid_pc=sigma_grid,
-            lam_base=lam_base,
-            max_jitter_tries=max_jitter_tries,
-            dtype=dtype,
-            device=device
-        )
-
-        self.MGE = MGEVelocityIntr(
-            N_components=N_MGE_components,
-            device=device,
-            dtype=dtype,
-            quad_points=quad_points,
-            radius_res=radius_res,
-            soft=soft,
-            G=G,
-        )
-        self.MGE.surf.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
-        self.MGE.sigma.to_static(self.projector.sigma_grid.clone())
-        self.MGE.qintr.to_static(torch.ones((N_MGE_components,), device=device, dtype=dtype))
-        self.MGE.M_to_L.to_static(torch.tensor(1.0, device=device, dtype=dtype))
-
-        # galaxy params
-        self.inc   = Param("inc",   shape=())
-        self.qintr = Param("qintr", shape=())
-        self.m_bh  = Param("m_bh",  shape=())
-
-        self.MGE.inc  = self.inc
-        self.MGE.m_bh = self.m_bh
-
-        # Core-Sérsic params
-        self.I_b   = Param("I_b",   shape=())        # log10(I_b) (consistent with Nuker version)
-        self.R_b   = Param("R_b",   shape=(1,))      # arcsec
-        self.R_e   = Param("R_e",   shape=(1,))      # arcsec
-        self.alpha = Param("alpha", shape=(1,))
-        self.gamma = Param("gamma", shape=(1,))
-        self.n     = Param("n",     shape=(1,))
-
-        self.qintr_shaper = torch.ones((N_MGE_components,), device=device, dtype=dtype)
+        return self.projector.surf_from_profile(y)
 
     @forward
     def velocity(
         self,
         R_flat,
-        inc=None, qintr=None, m_bh=None,
-        I_b=None, R_b=None, R_e=None, alpha=None, gamma=None, n=None
+        inc=None,
+        qintr=None,
+        m_bh=None,
+        alpha=None,
+        gmb=None,
+        gamma=None,
+        r_b=None,
+        I_b=None,
     ):
-        # arcsec -> pc
-        R_b_pc = torch.clamp(R_b * self.pc_per_arcsec, min=self._eps)
-        R_e_pc = torch.clamp(R_e * self.pc_per_arcsec, min=self._eps)
-        I_b_lin = torch.pow(torch.tensor(10.0, device=self.device, dtype=self.dtype), I_b)
+        return self.MGE.velocity(R_map=R_flat)
 
-        # profile on r_grid
+
+# -----------------------------
+# Core-Sérsic
+# -----------------------------
+class CoreSersicMGE(_PreLSMGEBase):
+    """
+    Core-Sérsic params -> profile -> functional-pointer surf -> MGE velocity
+    """
+    def __init__(
+        self,
+        N_MGE_components: int,
+        *,
+        distance_Mpc: float,
+        soft: float,
+        device,
+        dtype,
+        n_radii_data: int = 100,
+        r_min_pc: float = 1.0,
+        r_max_pc: float = 1e4,
+        lam_base: float = 1e-6,
+        max_jitter_tries: int = 12,
+        quad_points: int = 128,
+        radius_res: int = 4096,
+        G: float = 0.004301,
+    ):
+        super().__init__(
+            "CoreSersicMGE",
+            N_MGE_components,
+            distance_Mpc=distance_Mpc,
+            soft=soft,
+            device=device,
+            dtype=dtype,
+            n_radii_data=n_radii_data,
+            r_min_pc=r_min_pc,
+            r_max_pc=r_max_pc,
+            lam_base=lam_base,
+            max_jitter_tries=max_jitter_tries,
+            quad_points=quad_points,
+            radius_res=radius_res,
+            G=G,
+        )
+
+        self.I_b = Param("I_b", shape=())       # log10(I_b)
+        self.R_b = Param("R_b", shape=(1,))     # arcsec
+        self.R_e = Param("R_e", shape=(1,))     # arcsec
+        self.alpha = Param("alpha", shape=(1,))
+        self.gamma = Param("gamma", shape=(1,))
+        self.n = Param("n", shape=(1,))
+
+        self.MGE.surf = self._surf_pointer
+        self.MGE.surf.link([self.I_b, self.R_b, self.R_e, self.alpha, self.gamma, self.n])
+
+    def _surf_pointer(self, p):
+        R_b_pc = torch.clamp(p.R_b.value * self.pc_per_arcsec, min=self._eps)
+        R_e_pc = torch.clamp(p.R_e.value * self.pc_per_arcsec, min=self._eps)
+        I_b_lin = torch.pow(self._ten(), p.I_b.value)
+
         y = core_sersic_torch_1d(
             self.projector.r_grid,
             I_b_lin,
             R_b_pc.squeeze(),
             R_e_pc.squeeze(),
-            alpha.squeeze(),
-            gamma.squeeze(),
-            n.squeeze(),
+            p.alpha.value.squeeze(),
+            p.gamma.value.squeeze(),
+            p.n.value.squeeze(),
             eps=float(self._eps.item()),
         )
-
-        surf = self.projector.surf_from_profile(y)
-        sigma = self.projector.sigma_grid
-
-        v_rot = self.MGE.velocity(
-            R_map=R_flat,
-            surf=surf,
-            sigma=sigma,
-            qintr=qintr * self.qintr_shaper
-        )
-        return v_rot
-
-
-
-########################################################## DEPRECATED MODELS BELOW THIS LINE #####################################################################
-
-class Nuker_MGE(Module):
-    def __init__(self, N_MGE_components: int, Nuker_NN, NN_dtype, distance, r_min, r_max, soft, device, dtype, quad_points=128):
-        super().__init__("NukerMGE")
-        self.N_components = N_MGE_components
-        self.soft = soft
-        self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.sigma.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.qintr.to_static(torch.ones((self.N_components), device = device).to(dtype = dtype))
-        self.MGE.M_to_L.to_static(torch.tensor(1.0, dtype = dtype, device = device))
-        self.NN = Nuker_NN
-
-        inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
-        outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
-        low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
-        high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
-        dx=(high_Gauss-low_Gauss)/self.N_components
-        
-        # --- SOLUTION ---
-        # Ensure all scalars are tensors of the correct dtype before the calculation
-        distance_t = torch.tensor(distance, device=device, dtype=dtype)
-        pi_t = torch.tensor(np.pi, device=device, dtype=dtype)
-        
-        self.sigma = (distance_t * (pi_t / 0.648)) * 10**(low_Gauss + (0.5 + torch.arange(self.N_components, device=device, dtype=dtype)) * dx)
-        
-        self.inc   = Param("inc",   shape=())
-        self.qintr = Param("qintr", shape=())
-        self.qintr_shaper = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.m_bh  = Param("m_bh",  shape=())
-        self.MGE.inc = self.inc
-        self.MGE.m_bh = self.m_bh
-
-        self.alpha = Param("alpha", shape=(1, ))
-        self.gmb = Param("gamma_minus_beta", shape=(1, ))
-        self.gamma = Param("gamma", shape=(1, ))
-        self.r_b = Param("break_r", shape = ())
-        self.I_b = Param("intensity_r_b", shape = ())
-        self.dtype = dtype
-        self.NN_dtype = NN_dtype
-    
-    def symexp(self, y, linthresh=1e-12, base=10.0):
-        # --- SOLUTION ---
-        # Create tensor constants that match the input tensor's properties
-        linthresh_t = torch.tensor(linthresh, device=y.device, dtype=y.dtype)
-        base_t = torch.tensor(base, device=y.device, dtype=y.dtype)
-        one_t = torch.tensor(1.0, device=y.device, dtype=y.dtype)
-    
-        return torch.sign(y) * linthresh_t * (base_t**torch.abs(y) - one_t)
+        return self.projector.surf_from_profile(y)
 
     @forward
-    def velocity(self, R_flat,
-                 inc=None, qintr=None, m_bh=None,
-                 alpha = None, gmb = None, gamma = None, r_b = None, I_b = None,
-                 G=0.004301):
-        device = R_flat.device
-        dtype  = R_flat.dtype
-        beta = gamma - gmb
+    def velocity(
+        self,
+        R_flat,
+        inc=None,
+        qintr=None,
+        m_bh=None,
+        I_b=None,
+        R_b=None,
+        R_e=None,
+        alpha=None,
+        gamma=None,
+        n=None,
+    ):
+        return self.MGE.velocity(R_map=R_flat)
 
-        NN_input = torch.cat([alpha, beta, gamma])#.to(self.NN_dtype)
-        NN_output_transformed = self.NN.forward(NN_input)#.to(self.dtype)
-        NN_output = self.symexp(NN_output_transformed)
-        
-        surf = NN_output*10**I_b
-        MGE_sigma = self.sigma*r_b
-        v_rot = self.MGE.velocity(R_map = R_flat, surf = surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
-        return v_rot
+
+# ------------------------------------------
+# Gas mass profile (exponential disk model)
+# ------------------------------------------
+
+class GasSelfGrav(Module):
+    def __init__(self,intensity_model,device,dtype):
+        super().__init__("GasSelfGrav")
+        self.scale = intensity_model.scale
+        self.m_gas = Param("m_gas",  shape=())
+
+    @forward
+    def velocity(self, R_flat, m_gas = None, scale = None, G=0.004301):
+        x=R_flat/scale
+        ## based on eqn 8.74 in "Dynamics and Astrophysics of Galaxies" by Bovy 
+        prefac=((G*(10**m_gas))/(2*scale))*(x**2)
+        endfac=modified_bessel_i0(x/2)*modified_bessel_k0(x/2) - modified_bessel_i1(x/2)*modified_bessel_k1(x/2)
+        vcsqr=prefac*endfac
+        return torch.sqrt(vcsqr)
+
+
+# --------------------------
+# Composable mass models
+# --------------------------
+
+class QuadratureVelocitySum(Module):
+    def __init__(self, models: Tuple[Module, ...], name: Optional[str] = None):
+        super().__init__(name or "MultiComponentMass")
+
+        self.n_models = len(models)
+        self._model_names = []
+
+        for i, model in enumerate(models):
+            attr = f"model_{i}"
+            setattr(self, attr, model)
+            self._model_names.append(attr)
+
+        # Look for inclination-like params on child models.
+        # Support either `.inc` or `.inclination`.
+        inclination_attrs = []
+        for name in self._model_names:
+            model = getattr(self, name)
+
+            if hasattr(model, "inc") and isinstance(getattr(model, "inc"), Param):
+                inclination_attrs.append((name, "inc"))
+            elif hasattr(model, "inclination") and isinstance(getattr(model, "inclination"), Param):
+                inclination_attrs.append((name, "inclination"))
+
+        # If any child has an inclination param, create one shared top-level param
+        # and point all such children to it.
+        if len(inclination_attrs) > 0:
+            self.inc = Param("inclination", shape=())
+
+            for model_name, attr_name in inclination_attrs:
+                model = getattr(self, model_name)
+                setattr(model, attr_name, self.inc)
+
+    @forward
+    def velocity(self, R_flat, inclination=None):
+        v2_total = torch.zeros_like(R_flat)
+
+        for name in self._model_names:
+            model = getattr(self, name)
+            v_cur = model.velocity(R_flat)
+            v2_total = v2_total + v_cur**2
+
+        return torch.sqrt(v2_total)
+
+
