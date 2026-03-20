@@ -39,9 +39,9 @@ def create_velocity_grid_stable(
     
     # --- Step 3: Construct the final grid using the TARGET PRECISION (float32) ---
     # This operation is now numerically stable.
-    v_start_final = v_start_64.to(target_dtype)
-    delta_v_final = delta_v_64.to(target_dtype)
-    indices = torch.arange(num_points, dtype=target_dtype)
+    v_start_final = v_start_64.to(dtype=target_dtype, device=device)
+    delta_v_final = delta_v_64.to(dtype=target_dtype, device=device)
+    indices = torch.arange(num_points, dtype=target_dtype, device=device)
     
     abs_velocities = v_start_final + indices * delta_v_final
 
