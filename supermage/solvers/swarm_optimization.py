@@ -342,3 +342,184 @@ def sobol_ga_swarm_no_nan(
                   f"best={best_val.item():.4g}")
 
     return best_X, best_val, best_L, history
+
+
+# ---------------------------------------------------------------------
+# 4. Efficient variant: DataLoader-based parallel scouting + memory flush
+# ---------------------------------------------------------------------
+def sobol_ga_swarm_efficient(
+        lm_fn,
+        param_bounds,
+        n_particles,
+        n_chi,
+        *,
+        oversample   = 10,       # generate oversample × n_particles scouts
+        keep_frac    = 0.10,     # keep this fraction after scouting
+        n_workers    = 2,        # DataLoader prefetch workers
+        dtype        = torch.float64,
+        device       = "cpu",
+        lm_kwargs    = None,
+        verbose      = True,
+        seed         = 42,
+):
+    """
+    Two-stage optimisation identical to ``sobol_ga_swarm_no_nan``, with two
+    efficiency improvements:
+
+    **Stage 1 – DataLoader-based parallel prefetch scouting**
+        Scouts are wrapped in a ``TensorDataset`` / ``DataLoader`` (mirroring
+        ``batch_chi2``).  ``n_workers`` background processes prefetch the next
+        scout parameter vector while the GPU is busy with the current forward
+        pass, overlapping CPU↔GPU transfers with compute.  ``pin_memory=True``
+        is enabled automatically when running on CUDA so the async transfer
+        path is used.  Each chi² scalar is moved to CPU immediately after
+        evaluation, releasing the forward-pass activations before the next
+        scout starts.
+
+    **Stage 1→2 memory flush**
+        Once the top-k survivors have been selected, *all* scouting tensors
+        (scouts, chi² values, Cinv, …) are explicitly deleted and
+        ``torch.cuda.empty_cache()`` is called before entering the LM loop.
+        This returns the full GPU memory budget to the Jacobian allocations
+        inside the LM solver.  ``torch.cuda.empty_cache()`` is also called
+        after every individual LM run to prevent fragmentation.
+
+    Parameters
+    ----------
+    n_workers : int
+        Number of DataLoader worker processes for scout prefetching.
+        0 disables multiprocessing (useful for debugging).
+
+    All other parameters are identical to ``sobol_ga_swarm_no_nan``.
+
+    Returns
+    -------
+    best_X, best_chi2, best_L, history
+    """
+    if lm_kwargs is None:
+        lm_kwargs = {}
+
+    Y = lm_kwargs["Y"]
+    f = lm_kwargs["f"]
+    C = lm_kwargs.get("C", None)
+
+    # Build Cinv once on device
+    if C is None:
+        Cinv = torch.ones_like(Y, dtype=dtype, device=device)
+    elif C.ndim == 1:
+        Cinv = 1.0 / C.to(dtype=dtype, device=device)
+    else:
+        Cinv = torch.linalg.inv(C.to(dtype=dtype, device=device))
+
+    Y_dev    = Y.to(device)
+    Cinv_dev = Cinv.to(device)
+
+    # ------------------------------------------------------------------
+    # Stage 1 – Sobol sampling  (scouts kept on CPU for DataLoader workers)
+    # ------------------------------------------------------------------
+    n_scouts = int(math.ceil(oversample * n_particles))
+    engine   = SobolEngine(dimension=len(param_bounds), scramble=True, seed=seed)
+    bounds   = torch.as_tensor(param_bounds, dtype=dtype)          # CPU
+    low, high = bounds[:, 0], bounds[:, 1]
+    scouts_u  = engine.draw(n_scouts).to(dtype=dtype)              # CPU
+    scouts_cpu = low + (high - low) * scouts_u                     # (N, D) CPU
+
+    # ------------------------------------------------------------------
+    # Stage 1 – DataLoader-based chi² scouting
+    # DataLoader workers prefetch scout vectors on CPU while the GPU runs
+    # the previous forward pass, overlapping transfer with compute.
+    # ------------------------------------------------------------------
+    use_pin = (device != "cpu") and torch.cuda.is_available()
+    dataset = TensorDataset(scouts_cpu)
+    loader  = DataLoader(
+        dataset,
+        batch_size  = 1,
+        shuffle     = False,
+        num_workers = n_workers,
+        pin_memory  = use_pin,
+    )
+
+    chi2_list = []
+    with torch.no_grad():
+        for (x_batch,) in tqdm(loader, desc="Scouting"):
+            # squeeze batch dim; non_blocking overlaps transfer with GPU work
+            x_i  = x_batch.squeeze(0).to(device, non_blocking=use_pin)
+            fY   = f(x_i)
+            dY   = Y_dev - fY
+            chi2 = (dY ** 2 * Cinv_dev).sum()
+            chi2_list.append(chi2.cpu())   # CPU immediately → frees activations
+
+    chi2_scouts = torch.stack(chi2_list)   # (N,)  on CPU
+
+    # Keep scouts on CPU for NaN filtering, then move survivors to device
+    valid_mask   = ~torch.isnan(chi2_scouts)
+    valid_chi2   = chi2_scouts[valid_mask]
+    valid_scouts = scouts_cpu[valid_mask]  # still CPU
+
+    n_valid = int(valid_mask.sum())
+    if verbose and n_valid < n_scouts:
+        print(f"⇢ Filtered out {n_scouts - n_valid} NaN scouts.")
+
+    k = min(max(1, int(keep_frac * n_scouts)), n_valid)
+
+    if k > 0:
+        top_vals, top_idx = torch.topk(-valid_chi2, k)   # ascending
+        # Move survivors to device for LM
+        survivors = valid_scouts[top_idx].to(dtype=dtype, device=device)
+    else:
+        survivors = torch.empty((0, scouts_cpu.shape[1]), dtype=dtype, device=device)
+
+    if verbose:
+        if k > 0:
+            best_raw = (-top_vals).min().item()
+            print(f"⇢ Scouted {n_scouts} points, {n_valid} valid, "
+                  f"best raw χ²/n = {best_raw / n_chi:.4g}")
+            print(f"⇢ Keeping {k} survivors for LM refinement …")
+            print((-top_vals).cpu().numpy() / n_chi)
+        else:
+            print(f"⇢ Scouted {n_scouts} points — no valid (non-NaN) scouts found.")
+
+    # ------------------------------------------------------------------
+    # Memory flush before LM
+    # ------------------------------------------------------------------
+    del scouts_cpu, scouts_u, chi2_scouts, valid_chi2, valid_mask, valid_scouts
+    del chi2_list, Y_dev, Cinv_dev, Cinv
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if verbose:
+        print("⇢ GPU cache cleared — starting LM refinement.")
+
+    # ------------------------------------------------------------------
+    # Stage 2 – serial LM refinement on survivors
+    # ------------------------------------------------------------------
+    history  = []
+    best_val = torch.tensor(float("inf"), dtype=dtype, device=device)
+    best_X   = None
+    best_L   = None
+
+    for i, x0 in enumerate(survivors, 1):
+        res = lm_fn(x0.clone(), **lm_kwargs)
+        X_opt, L_opt, chi2_opt = res
+
+        history.append(dict(
+            idx  = i,
+            X    = X_opt.detach().cpu(),
+            chi2 = float(chi2_opt),
+            L    = float(L_opt),
+        ))
+
+        if chi2_opt < best_val:
+            best_val = chi2_opt.detach()
+            best_X   = X_opt.detach().clone()
+            best_L   = L_opt
+
+        if verbose:
+            print(f"[{i:>3}/{k}] χ²/n={chi2_opt.item()/n_chi:.4g}   "
+                  f"best={best_val.item()/n_chi:.4g}")
+
+        # Clear LM temporaries between runs to reduce fragmentation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return best_X, best_val, best_L, history
