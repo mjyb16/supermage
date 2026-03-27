@@ -192,8 +192,8 @@ def sobol_ga_swarm_opt(
 
     if verbose:
         best_raw = (-top_vals).min().item()
-        print(f"⇢ Scouted {n_scouts} points, best raw χ² = {best_raw/n_chi:.4g}")
-        print(f"⇢ Keeping {k} best points for LM refinement …")
+        print(f"Scouted {n_scouts} points, best raw χ² = {best_raw/n_chi:.4g}")
+        print(f"Keeping {k} best points for LM refinement …")
         print(top_vals.cpu().numpy()/n_chi)
 
     # ------------------------------------------------------------------
@@ -288,7 +288,7 @@ def sobol_ga_swarm_no_nan(
     valid_scouts = scouts[valid_mask]
 
     if verbose and not torch.all(valid_mask):
-        print(f"⇢ Filtered out {torch.sum(~valid_mask)} NaN values.")
+        print(f"Filtered out {torch.sum(~valid_mask)} NaN values.")
 
     # keep the best ‘keep_frac’ fraction from the valid scouts
     k = max(1, int(keep_frac * n_scouts))
@@ -308,11 +308,11 @@ def sobol_ga_swarm_no_nan(
     if verbose:
         if k > 0:
             best_raw = (-top_vals).min().item()
-            print(f"⇢ Scouted {n_scouts} points, found {num_valid_scouts} valid, best raw χ² = {best_raw/n_chi:.4g}")
-            print(f"⇢ Keeping {k} best points for LM refinement …")
+            print(f"Scouted {n_scouts} points, found {num_valid_scouts} valid, best raw χ² = {best_raw/n_chi:.4g}")
+            print(f"Keeping {k} best points for LM refinement …")
             print((-top_vals).cpu().numpy()/n_chi)
         else:
-            print(f"⇢ Scouted {n_scouts} points, but no valid (non-NaN) points were found.")
+            print(f"Scouted {n_scouts} points, but no valid (non-NaN) points were found.")
 
 
     # ------------------------------------------------------------------
@@ -458,7 +458,7 @@ def sobol_ga_swarm_efficient(
 
     n_valid = int(valid_mask.sum())
     if verbose and n_valid < n_scouts:
-        print(f"⇢ Filtered out {n_scouts - n_valid} NaN scouts.")
+        print(f"Filtered out {n_scouts - n_valid} NaN scouts.")
 
     k = min(max(1, int(keep_frac * n_scouts)), n_valid)
 
@@ -472,12 +472,12 @@ def sobol_ga_swarm_efficient(
     if verbose:
         if k > 0:
             best_raw = (-top_vals).min().item()
-            print(f"⇢ Scouted {n_scouts} points, {n_valid} valid, "
+            print(f"Scouted {n_scouts} points, {n_valid} valid, "
                   f"best raw χ²/n = {best_raw / n_chi:.4g}")
-            print(f"⇢ Keeping {k} survivors for LM refinement …")
+            print(f"Keeping {k} survivors for LM refinement …")
             print((-top_vals).cpu().numpy() / n_chi)
         else:
-            print(f"⇢ Scouted {n_scouts} points — no valid (non-NaN) scouts found.")
+            print(f"Scouted {n_scouts} points — no valid (non-NaN) scouts found.")
 
     # ------------------------------------------------------------------
     # Memory flush before LM
@@ -488,7 +488,7 @@ def sobol_ga_swarm_efficient(
         torch.cuda.empty_cache()
 
     if verbose:
-        print("⇢ GPU cache cleared — starting LM refinement.")
+        print("GPU cache cleared — starting LM refinement.")
 
     # ------------------------------------------------------------------
     # Stage 2 – serial LM refinement on survivors
