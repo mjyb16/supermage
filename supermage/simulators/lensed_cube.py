@@ -226,8 +226,9 @@ class AnalyticLens(Module):
         idx1 = iv1 * stride_xy + baseY * self.N_pix_hi + baseX
 
         flat = cube_hi.view(-1)
-        flat.scatter_add_(0, idx0.reshape(-1), (fsub * w0).reshape(-1))
-        flat.scatter_add_(0, idx1.reshape(-1), (fsub * w1).reshape(-1))
+        flat = flat.scatter_add(0, idx0.reshape(-1), (fsub * w0).reshape(-1))
+        flat = flat.scatter_add(0, idx1.reshape(-1), (fsub * w1).reshape(-1))
+        return flat.view(cube_hi.shape)
 
     @forward
     def forward(
@@ -273,7 +274,7 @@ class AnalyticLens(Module):
         # Quantile broadening along v
         if self.chunk_v is None:
             # Single pass: bin all K quantiles
-            self._bin_quantiles_along_v_(cube_hi, v_los, I_map, line_broadening)
+            cube_hi = self._bin_quantiles_along_v_(cube_hi, v_los, I_map, line_broadening)
         else:
             # Optional: process spatial tiles to reduce peak memory (rarely needed)
             # Here, we chunk *velocity planes* post-binning would not help (binning is 1D).
@@ -283,8 +284,8 @@ class AnalyticLens(Module):
                 y1i = min(self.N_pix_hi, y0i + tile)
                 for x0i in range(0, self.N_pix_hi, tile):
                     x1i = min(self.N_pix_hi, x0i + tile)
-                    self._bin_quantiles_along_v_(
-                        cube_hi[:, y0i:y1i, x0i:x1i],
+                    cube_hi[:, y0i:y1i, x0i:x1i] = self._bin_quantiles_along_v_(
+                        cube_hi[:, y0i:y1i, x0i:x1i].clone(),
                         v_los[y0i:y1i, x0i:x1i],
                         I_map[y0i:y1i, x0i:x1i],
                         line_broadening if line_broadening.ndim == 0

@@ -178,8 +178,9 @@ class AnalyticInverse(Module):
         idx1 = iv1 * stride_xy + baseY * self.N_pix_hi + baseX
 
         flat = cube_hi.view(-1)
-        flat.scatter_add_(0, idx0.reshape(-1), (fsub * w0).reshape(-1))
-        flat.scatter_add_(0, idx1.reshape(-1), (fsub * w1).reshape(-1))
+        flat = flat.scatter_add(0, idx0.reshape(-1), (fsub * w0).reshape(-1))
+        flat = flat.scatter_add(0, idx1.reshape(-1), (fsub * w1).reshape(-1))
+        return flat.view(cube_hi.shape)
 
     @forward
     def forward(
@@ -216,7 +217,7 @@ class AnalyticInverse(Module):
         )
 
         # Velocity broadening
-        self._bin_quantiles_along_v_(cube_hi, v_los, I_map, line_broadening)
+        cube_hi = self._bin_quantiles_along_v_(cube_hi, v_los, I_map, line_broadening)
 
         # Box-filter to low-res
         cube_hi = cube_hi.view(
