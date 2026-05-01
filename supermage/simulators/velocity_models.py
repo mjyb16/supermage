@@ -264,7 +264,12 @@ class MGEVelocityIntr(Module):
         Returns v_rot(R) for every pixel in the sky plane.
         """
         Rmin = torch.as_tensor(self.soft, dtype=self.dtype, device=self.device)
-        Rmax = R_map.max()
+        # Detach Rmax from the AD graph: the grid is a numerical lookup table whose
+        # *spacing* does not need to carry gradients.  Differentiating through
+        # torch.logspace w.r.t. its start/end args is not supported in forward AD
+        # (jacfwd), and the effect of slightly shifted grid bounds on the
+        # interpolated velocity is negligible for any dense grid.
+        Rmax = R_map.max().detach()
 
         # 1-D lookup table (same as before)
         R_grid = torch.logspace(
