@@ -18,6 +18,22 @@ def log_prior_tophat(theta, low, high):
     in_box = (theta >= low).all() & (theta <= high).all()
     return torch.tensor(0., device = device, dtype = dtype) if in_box else torch.tensor(-torch.inf, device = device, dtype = dtype)
 
+def log_prior_tophat_vmappable(theta, low, high):
+    """torch.where-based flat prior — vmappable AND autograd-compatible.
+
+    Uses ``(theta * 0.).sum()`` to produce a differentiable zero inside the
+    box so that the autograd graph is preserved for MALA's backward pass.
+    The gradient w.r.t. theta is identically zero everywhere inside the box,
+    which is correct for a flat prior.
+    """
+    in_box = ((theta >= low) & (theta <= high)).all()
+    zero   = (theta * 0.).sum()   # grad w.r.t. theta = 0; preserves grad_fn
+    return torch.where(
+        in_box,
+        zero,
+        torch.full((), float("-inf"), device=theta.device, dtype=theta.dtype),
+    )
+
 def _logp_and_grad_batch(x, log_prob_fn):
     # one forward builds graph; one backward gives all grads
     x = x.detach().clone().requires_grad_(True)
@@ -25,6 +41,20 @@ def _logp_and_grad_batch(x, log_prob_fn):
     logps.sum().backward()
     grads = x.grad.detach()                                  # (C,D)
     return logps.detach(), grads
+
+def _logp_and_grad_batch_vmap(x, log_prob_fn):
+    """
+    Vectorised log-prob + gradient via torch.func.vmap + value_and_grad.
+
+    x            : (C, D) tensor — batch of chain positions
+    log_prob_fn  : xi → scalar tensor (must be vmappable: no Python-level branching)
+
+    Returns (logps (C,), grads (C, D)) — both detached CPU/device tensors.
+    """
+    from torch.func import vmap, value_and_grad
+    single_vng = value_and_grad(log_prob_fn)
+    logps, grads = vmap(single_vng)(x)
+    return logps.detach(), grads.detach()
 
 def mala(
     log_prob_fn,
@@ -34,6 +64,7 @@ def mala(
     mass_matrix=None,            # Σ
     hastings=True,
     progress=True,
+    use_vmap: bool = True,
 ):
     x = init.detach().clone()
     dtype, device = x.dtype, x.device
@@ -48,7 +79,14 @@ def mala(
     chi2_trace = torch.empty((n_steps, C),    dtype=dtype, device=device)
 
     # cache current logp and grad once
-    logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
+    if use_vmap:
+        try:
+            logp_cur, grad_cur = _logp_and_grad_batch_vmap(x, log_prob_fn)
+        except Exception:
+            use_vmap = False
+            logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
+    else:
+        logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
 
     # RNG (device-local)
     rng = torch.Generator(device=device)
@@ -64,9 +102,16 @@ def mala(
         mu_x  = x + 0.5 * (eps**2) * (grad_cur @ Σ)                 # (C,D)
         noise = torch.randn(C, D, generator=rng, device=device, dtype=dtype) @ L.T
         x_prop = mu_x + eps * noise
-        
+
         # single forward+backward at proposal
-        logp_prop, grad_prop = _logp_and_grad_batch(x_prop, log_prob_fn)
+        if use_vmap:
+            try:
+                logp_prop, grad_prop = _logp_and_grad_batch_vmap(x_prop, log_prob_fn)
+            except Exception:
+                use_vmap = False
+                logp_prop, grad_prop = _logp_and_grad_batch(x_prop, log_prob_fn)
+        else:
+            logp_prop, grad_prop = _logp_and_grad_batch(x_prop, log_prob_fn)
 
         if hastings:
             mu_xp = x_prop + 0.5 * (eps**2) * (grad_prop @ Σ)
@@ -119,6 +164,7 @@ def checkpointed_mala(
     checkpoint_dir=None,         # directory for checkpoint files; None = disabled
     checkpoint_every=500,        # save a checkpoint every this many steps
     resume=True,                 # if True, try to reload an existing checkpoint
+    use_vmap: bool = True,
 ):
     """
     MALA sampler with disk checkpointing.
@@ -151,6 +197,9 @@ def checkpointed_mala(
         Write a checkpoint after every this many completed steps.
     resume : bool
         If True and a checkpoint file exists in ``checkpoint_dir``, resume from it.
+    use_vmap : bool
+        If True, attempt to use torch.func.vmap for batched gradient computation.
+        Falls back to serial loop on failure.
 
     Returns
     -------
@@ -201,18 +250,31 @@ def checkpointed_mala(
         x        = torch.tensor(ckpt["x"],        device=device, dtype=dtype)
         logp_cur = torch.tensor(ckpt["logp_cur"], device=device, dtype=dtype)
         grad_cur = torch.tensor(ckpt["grad_cur"], device=device, dtype=dtype)
+
+        # Restore RNG state
+        torch.set_rng_state(torch.tensor(ckpt["rng_cpu"], dtype=torch.uint8))
+        if "rng_cuda" in ckpt and device.type == 'cuda':
+            torch.cuda.set_rng_state(torch.tensor(ckpt["rng_cuda"], dtype=torch.uint8), device)
+
         print(f"[checkpoint] Resumed at step {start_step}/{n_steps}  "
               f"(χ²_mean={float(chi2_trace[start_step-1].mean()):.4f})")
     else:
         # Fresh start: compute initial logp and gradient
-        logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
+        if use_vmap:
+            try:
+                logp_cur, grad_cur = _logp_and_grad_batch_vmap(x, log_prob_fn)
+            except Exception:
+                use_vmap = False
+                logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
+        else:
+            logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
 
     # ── Save helper ───────────────────────────────────────────────────────────
     def _save_checkpoint(step_done):
         if ckpt_path is None:
             return
-        np.savez(
-            ckpt_path,
+        rng_cpu = torch.get_rng_state().numpy()
+        save_kwargs = dict(
             step       = np.array(step_done),
             x          = x.cpu().numpy(),
             logp_cur   = logp_cur.cpu().numpy(),
@@ -220,7 +282,12 @@ def checkpointed_mala(
             samples    = samples,
             acc_mask   = acc_mask,
             chi2_trace = chi2_trace,
+            rng_cpu    = rng_cpu,
         )
+        if device.type == 'cuda':
+            rng_cuda = torch.cuda.get_rng_state(device).numpy()
+            save_kwargs["rng_cuda"] = rng_cuda
+        np.savez(ckpt_path, **save_kwargs)
 
     # ── Main sampling loop ────────────────────────────────────────────────────
     it = range(start_step, n_steps)
@@ -234,7 +301,14 @@ def checkpointed_mala(
         noise  = torch.randn(C, D, device=device, dtype=dtype) @ L.T
         x_prop = mu_x + eps * noise
 
-        logp_prop, grad_prop = _logp_and_grad_batch(x_prop, log_prob_fn)
+        if use_vmap:
+            try:
+                logp_prop, grad_prop = _logp_and_grad_batch_vmap(x_prop, log_prob_fn)
+            except Exception:
+                use_vmap = False
+                logp_prop, grad_prop = _logp_and_grad_batch(x_prop, log_prob_fn)
+        else:
+            logp_prop, grad_prop = _logp_and_grad_batch(x_prop, log_prob_fn)
 
         if hastings:
             mu_xp = x_prop + 0.5 * (eps ** 2) * (grad_prop @ Σ)
