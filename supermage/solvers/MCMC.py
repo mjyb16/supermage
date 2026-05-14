@@ -44,16 +44,20 @@ def _logp_and_grad_batch(x, log_prob_fn):
 
 def _logp_and_grad_batch_vmap(x, log_prob_fn):
     """
-    Vectorised log-prob + gradient via torch.func.vmap + value_and_grad.
+    Vectorised log-prob + gradient via torch.func.vmap + grad_and_value.
 
-    x            : (C, D) tensor — batch of chain positions
-    log_prob_fn  : xi → scalar tensor (must be vmappable: no Python-level branching)
+    x           : (C, D)
+    log_prob_fn : xi -> scalar tensor
 
-    Returns (logps (C,), grads (C, D)) — both detached CPU/device tensors.
+    Returns:
+        logps : (C,)
+        grads : (C, D)
     """
-    from torch.func import vmap, value_and_grad
-    single_vng = value_and_grad(log_prob_fn)
-    logps, grads = vmap(single_vng)(x)
+    from torch.func import vmap, grad_and_value
+
+    single_gv = grad_and_value(log_prob_fn)
+    grads, logps = vmap(single_gv)(x)
+
     return logps.detach(), grads.detach()
 
 def mala(
@@ -82,7 +86,8 @@ def mala(
     if use_vmap:
         try:
             logp_cur, grad_cur = _logp_and_grad_batch_vmap(x, log_prob_fn)
-        except Exception:
+        except Exception as e:
+            print("[MALA] vmap failed:", repr(e))
             use_vmap = False
             logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
     else:
