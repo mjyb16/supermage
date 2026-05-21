@@ -217,6 +217,7 @@ def checkpointed_mala(
     x = init.detach().clone()
     dtype, device = x.dtype, x.device
     C, D = x.shape
+    _use_vmap_initial = use_vmap   # remember for backend-summary message
 
     Σ = torch.eye(D, dtype=dtype, device=device) if mass_matrix is None \
         else torch.as_tensor(mass_matrix, dtype=dtype, device=device)
@@ -268,11 +269,21 @@ def checkpointed_mala(
         if use_vmap:
             try:
                 logp_cur, grad_cur = _logp_and_grad_batch_vmap(x, log_prob_fn)
-            except Exception:
+            except Exception as _ve:
+                print(f"[MALA] vmap unavailable at init "
+                      f"({type(_ve).__name__}: {_ve}) — "
+                      f"switching to sequential gradient loop.")
                 use_vmap = False
                 logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
         else:
             logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
+
+    # ── Backend summary (printed once, after fresh-start or resume) ───────────
+    if not use_vmap:
+        _why = "use_vmap=False" if not _use_vmap_initial else "vmap failed — see above"
+        print(f"[MALA] gradient backend: sequential loop ({_why})")
+    else:
+        print(f"[MALA] gradient backend: vmap  (C={C}, D={D})")
 
     # ── Save helper ───────────────────────────────────────────────────────────
     def _save_checkpoint(step_done):
@@ -309,7 +320,10 @@ def checkpointed_mala(
         if use_vmap:
             try:
                 logp_prop, grad_prop = _logp_and_grad_batch_vmap(x_prop, log_prob_fn)
-            except Exception:
+            except Exception as _ve:
+                print(f"\n[MALA] vmap failed at step {t} "
+                      f"({type(_ve).__name__}: {_ve}) — "
+                      f"switching to sequential gradient loop.")
                 use_vmap = False
                 logp_prop, grad_prop = _logp_and_grad_batch(x_prop, log_prob_fn)
         else:
