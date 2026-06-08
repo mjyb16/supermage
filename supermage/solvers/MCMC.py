@@ -8,7 +8,10 @@ def log_like_gaussian(theta, Y_obs, forward_func, Cinv):
     """
     fY   = forward_func(theta)
     dY   = Y_obs - fY
-    chi2 = (dY.square() * Cinv).sum()
+    # float64 reduction: forward model may be float32, but accumulating chi^2 in float32 at
+    # |logL| ~ 1e5-1e6 quantises the likelihood (~0.016-0.25 ULP) -> plateaus / sampler issues.
+    # Upcasting the residual before square+sum removes this at negligible cost (autograd-safe).
+    chi2 = (dY.double().square() * Cinv.double()).sum()
     return -0.5 * chi2
 
 def log_prior_tophat(theta, low, high):
