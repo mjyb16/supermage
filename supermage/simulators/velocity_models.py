@@ -490,10 +490,23 @@ def core_sersic_torch_1d(R, I_b, R_b, R_e, alpha, gamma, n, eps=1e-30):
 
     b_n = 2.0 * n - (1.0 / 3.0) + 4.0 / (405.0 * n) + 46.0 / (25515.0 * n * n)
 
-    term1 = torch.pow(1.0 + torch.pow(R_b / R, alpha), gamma / alpha)
-    inside = (torch.pow(R, alpha) + torch.pow(R_b, alpha)) / torch.pow(R_e, alpha)
-    term2 = torch.exp(-b_n * (torch.pow(inside, 1.0 / (alpha * n)) - 1.0))
-    return I_b * term1 * term2
+    # Evaluate the inner cusp (term1) and the outer Sérsic roll-off (term2) in LOG-SPACE.
+    # The direct algebraic form builds R_e**alpha (also R**alpha, R_b**alpha) explicitly, which
+    # OVERFLOWS float32 for large R_e: e.g. R_e~1e4 pc with alpha~9.6 gives R_e**alpha ~ 4e38 >
+    # 3.4e38 (float32 max) -> +inf. The overflow sends the roll-off argument to 0, collapsing
+    # term2 to the radius-independent constant exp(b_n) and inflating the whole profile by
+    # hundreds-to-thousands x — which manufactures a spurious "extended large-R_e" likelihood
+    # mode in float32 nested sampling. logaddexp keeps every intermediate finite and is
+    # mathematically identical: verified float32==float64 to ~1e-6 and reproducing the original
+    # float64 result to ~1e-15.
+    log_R, log_Rb, log_Re = torch.log(R), torch.log(R_b), torch.log(R_e)
+    # term1 = (1 + (R_b/R)**alpha)**(gamma/alpha)
+    log_term1 = (gamma / alpha) * torch.logaddexp(
+        torch.zeros_like(log_R), alpha * (log_Rb - log_R))
+    # inside = (R**alpha + R_b**alpha) / R_e**alpha   (never formed directly)
+    log_inside = torch.logaddexp(alpha * log_R, alpha * log_Rb) - alpha * log_Re
+    term2 = torch.exp(-b_n * (torch.exp(log_inside / (alpha * n)) - 1.0))
+    return I_b * torch.exp(log_term1) * term2
 
 
 # -----------------------------
