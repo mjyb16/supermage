@@ -4,14 +4,67 @@ import numpy as np
 from supermage.utils.primary_beams import gaussian_pb
 from supermage.utils.doppler_velocities import create_velocity_grid_stable
 
+
+def _check_hz(x, name):
+    """Frequencies are Hz everywhere in this module (ratio-based velocity math
+    is unit-agnostic, but the primary beam is not — a GHz value here used to
+    make the PB silently flat)."""
+    v = float(x)
+    if not (1e8 < v < 1e13):
+        raise ValueError(
+            f"{name} must be in Hz (1e8 < f < 1e13); got {v!r}. "
+            "A value of a few hundred suggests GHz — multiply by 1e9."
+        )
+
+
+def _fft_visibilities(cube_pb, pad, taper_map, mask, half_plane, npix):
+    """
+    Shared image-cube -> masked model-visibility path:
+      zero-pad -> optional MULTIPLY by the image-plane taper (the FT of the
+      gridding kernel, so the model matches per-cell kernel-weighted-mean
+      gridded data; the legacy code DIVIDED here, which is the inverted
+      convention) -> centered FFT -> optional Hermitian half-plane slab
+      (rows [npix//2:], valid for a real image on an odd grid) -> mask.
+    """
+    cube_pad = F.pad(cube_pb, pad, mode="constant", value=0.0)
+    if taper_map is not None:
+        cube_pad = cube_pad * taper_map[None, :, :]
+    fft_cube = torch.fft.fftshift(
+        torch.fft.fft2(
+            torch.fft.ifftshift(cube_pad, dim=(-2, -1)),
+            norm="backward",
+        ),
+        dim=(-2, -1),
+    )
+    if half_plane:
+        fft_cube = fft_cube[..., npix // 2:, :]
+    return fft_cube * mask.float()
+
+
+def _expected_mask_shape(n_chan, npix, half_plane):
+    if half_plane:
+        return (n_chan, (npix + 1) // 2, npix)
+    return (n_chan, npix, npix)
+
+
 class VisibilityCubePadded(Module):
     """
-    Identical public API except that padding is done *after* PB-weighting.
+    Image-cube simulator -> model visibilities on the (padded) FFT grid.
 
-    Optional feature:
-      - accepts an external image-plane apodization map (e.g. generated in VisCube)
-      - applies its stabilized inverse to the padded model cube before the FFT
-        so the UV-space forward model matches gridded data conventions.
+    Conventions (2026-07 corrected pipeline):
+      - ``freqs`` and ``line`` are in Hz.
+      - ``image_taper_map`` (npix, npix) is MULTIPLIED into the padded image
+        before the FFT. Pass the analytic taper of the gridding kernel
+        (e.g. ``viscube.make_kb_taper_map``) to match kernel-weighted-mean
+        gridded data. The legacy divide-by-apodization behavior is
+        reproducible by passing ``viscube.stabilized_inverse_map(apo)``.
+      - ``dish_diameter=None`` disables the primary beam (pb ≡ 1), which
+        reproduces the legacy silently-flat-PB behavior explicitly.
+      - ``output_half_plane=True`` returns only the non-redundant Hermitian
+        half of the uv plane: rows [npix//2:] of the fftshifted grid, shape
+        (N_chan, (npix+1)//2, npix). Requires odd npix and a mask of that
+        slab shape (with the DC row's duplicate columns already zeroed, see
+        ``viscube.half_plane_mask_fix``).
     """
     def __init__(
         self,
@@ -20,26 +73,41 @@ class VisibilityCubePadded(Module):
         freqs,
         npix,                 # final grid side
         pixelscale,           # ″ / pix on the final grid
-        dish_diameter: float = 12.0,
-        line = 230.538,
-        apodization_map = None,
-        deapod_eps_fraction = 1e-3,
-        deapod_clamp_max = 1e3,
+        dish_diameter=12.0,   # meters; None -> no primary beam (pb ≡ 1)
+        line=230.538e9,       # Hz
+        image_taper_map=None, # (npix, npix), multiplied before the FFT
+        fwhm_factor=1.13,     # PB FWHM = fwhm_factor * lambda / D
+        output_half_plane=False,
     ):
         super().__init__()
         self.cube_simulator = cube_simulator
-        self.mask           = mask
         self.freqs          = freqs
-        self.npix           = npix
+        self.npix           = int(npix)
         self.pixelscale     = pixelscale
         self.dish_diameter  = dish_diameter
+        self.output_half_plane = bool(output_half_plane)
 
         self.device = cube_simulator.device
         self.dtype  = cube_simulator.dtype
         self.flux   = Param("flux", None)
 
-        self.deapod_eps_fraction = float(deapod_eps_fraction)
-        self.deapod_clamp_max    = deapod_clamp_max
+        _check_hz(freqs[0], "freqs[0]")
+        _check_hz(freqs[-1], "freqs[-1]")
+        _check_hz(line, "line")
+
+        if self.output_half_plane and self.npix % 2 != 1:
+            raise ValueError(
+                f"output_half_plane=True requires odd npix, got {self.npix}."
+            )
+
+        mask_t = torch.as_tensor(mask, device=self.device)
+        exp_shape = _expected_mask_shape(len(freqs), self.npix, self.output_half_plane)
+        if tuple(mask_t.shape) != exp_shape:
+            raise ValueError(
+                f"mask shape {tuple(mask_t.shape)} does not match expected "
+                f"{exp_shape} (output_half_plane={self.output_half_plane})."
+            )
+        self.mask = mask_t
 
         # ── size of the *small* cube returned by cube_simulator ─────────
         self.small_side = cube_simulator.N_pix
@@ -58,20 +126,24 @@ class VisibilityCubePadded(Module):
 
         # ── primary beams ON THE SMALL GRID ─────────────────────────────
         #   (no need to generate values we’ll pad with zeros later)
-        self.pb_small = torch.stack(
-            [
-                gaussian_pb(
-                    diameter=self.dish_diameter,
-                    freq=f,
-                    shape=(self.small_side, self.small_side),
-                    deltal=self.pixelscale,
-                    device=self.device,
-                    dtype=self.dtype,
-                )[0]                                # gaussian_pb returns (pb, _)
-                for f in freqs
-            ],
-            dim=0,                                  # (N_chan, S, S)
-        )
+        if dish_diameter is None:
+            self.pb_small = None
+        else:
+            self.pb_small = torch.stack(
+                [
+                    gaussian_pb(
+                        diameter=dish_diameter,
+                        freq_hz=f,
+                        shape=(self.small_side, self.small_side),
+                        deltal=self.pixelscale,
+                        fwhm_factor=fwhm_factor,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )[0]                                # gaussian_pb returns (pb, _)
+                    for f in freqs
+                ],
+                dim=0,                                  # (N_chan, S, S)
+            )
 
         vel_axis, dv = create_velocity_grid_stable(
             f_start=freqs[0],
@@ -83,47 +155,32 @@ class VisibilityCubePadded(Module):
         )
         self.dv = dv[0]
 
-        # ── optional external apodization map (defined on FINAL FFT grid) ───────
-        self.apodization_map     = None
-        self.inv_apodization_map = None
-
-        if apodization_map is not None:
-            apo = torch.as_tensor(apodization_map, device=self.device, dtype=self.dtype)
-
-            if apo.shape != (self.npix, self.npix):
+        # ── image-plane taper (MULTIPLIED before the FFT) ────────────────
+        self.image_taper_map = None
+        if image_taper_map is not None:
+            taper = torch.as_tensor(image_taper_map, device=self.device, dtype=self.dtype)
+            if taper.shape != (self.npix, self.npix):
                 raise ValueError(
-                    "apodization_map must have shape "
-                    f"({self.npix}, {self.npix}), got {tuple(apo.shape)}."
+                    "image_taper_map must have shape "
+                    f"({self.npix}, {self.npix}), got {tuple(taper.shape)}."
                 )
-
-            self.apodization_map = apo
-
-            thresh  = self.deapod_eps_fraction * torch.max(torch.abs(apo))
-            inv_map = torch.where(
-                torch.abs(apo) >= thresh,
-                1.0 / apo,
-                torch.zeros_like(apo),
-            )
-
-            if self.deapod_clamp_max is not None:
-                inv_map = torch.clamp(
-                    inv_map,
-                    min=-float(self.deapod_clamp_max),
-                    max= float(self.deapod_clamp_max),
-                )
-
-            self.inv_apodization_map = inv_map
+            self.image_taper_map = taper
 
     # ---------------------------------------------------------------------
     @forward
     def forward(self, flux=None):
         """
-        Returns the padded FFT cube in UV space, masked by self.mask.
+        Returns the model visibility cube, masked by self.mask:
+        (N_chan, npix, npix), or (N_chan, (npix+1)//2, npix) when
+        output_half_plane=True.
         """
         cube_small = self.cube_simulator.forward()          # (N_chan, S, S)
 
         # 1. multiply by primary beam on the small grid
-        cube_pb = cube_small * self.pb_small                # (N_chan, S, S)
+        if self.pb_small is not None:
+            cube_pb = cube_small * self.pb_small            # (N_chan, S, S)
+        else:
+            cube_pb = cube_small
         del cube_small
 
         # 2. scale to requested total flux *before* padding
@@ -131,25 +188,11 @@ class VisibilityCubePadded(Module):
             flux = self.flux if self.flux is not None else 1.0
         cube_pb = cube_pb * flux / torch.abs(self.dv) / cube_pb.sum()  # Integrated flux in Jy km/s
 
-        # 3. pad *both* spatial axes to (npix, npix)
-        cube_pad = F.pad(cube_pb, self.pad, mode="constant", value=0.0)
-        del cube_pb
-
-        # 4. optional de-apodization before FFT
-        if self.inv_apodization_map is not None:
-            cube_pad = cube_pad * self.inv_apodization_map[None, :, :]
-
-        # 5. FFT (channel-wise 2D)
-        fft_cube = torch.fft.fftshift(
-            torch.fft.fft2(
-                torch.fft.ifftshift(cube_pad, dim=(-2, -1)),
-                norm="backward",
-            ),
-            dim=(-2, -1),
+        # 3. pad, taper, FFT, (half-plane), mask
+        return _fft_visibilities(
+            cube_pb, self.pad, self.image_taper_map, self.mask,
+            self.output_half_plane, self.npix,
         )
-        del cube_pad                                        # memory
-
-        return fft_cube * self.mask.float()                 # (N_chan, npix, npix)
 
 
 class JointVisibilityCube(Module):
@@ -160,16 +203,11 @@ class JointVisibilityCube(Module):
       1. down-samples the shared cube to that dataset's image grid (flux/area-conserving),
       2. multiplies by that dataset's primary beam,
       3. scales to that dataset's own ``flux`` (a separate Param per dataset),
-      4. pads to that dataset's uv-grid, de-apodizes, FFTs, and masks.
+      4. pads to that dataset's uv-grid, applies that dataset's image-plane taper, FFTs, and masks.
 
     ``forward()`` returns a list of per-dataset model visibility cubes (same shape/convention as
     ``VisibilityCubePadded.forward()`` would return for each dataset), so it plugs straight into a
     per-dataset Gaussian visibility likelihood that is summed across datasets.
-
-    The shared source (image cube, velocity model, geometry, ...) is computed **once**; only the flux
-    and uv-sampling/beam differ per dataset.  The module is independent of the underlying layers:
-    ``cube_simulator`` may be any image-cube ``Module`` exposing ``.forward() -> (N_chan, S, S)``,
-    ``.N_pix`` (int side of that cube), ``.device`` and ``.dtype``.
 
     Parameters
     ----------
@@ -177,13 +215,16 @@ class JointVisibilityCube(Module):
         Shared source cube simulator, built at the finest dataset's image grid.
     datasets : list[dict]
         One dict per dataset, each with keys:
-          ``name`` (str), ``mask`` (bool array, (N_chan, npix, npix)), ``freqs`` (seq, len N_chan),
-          ``npix`` (int, final uv-grid side), ``pixelscale`` (float, ''/pix on the final grid),
-          ``N_px`` (int, image-cube side for this dataset; must be <= cube_simulator.N_pix),
-          and optional ``apodization_map`` ((npix, npix)).
-    dish_diameter, line, deapod_eps_fraction, deapod_clamp_max, downsample_mode :
-        Same conventions as ``VisibilityCubePadded`` (``downsample_mode`` is the ``F.interpolate``
-        mode used to degrade the shared cube to a coarser grid; ``'area'`` is flux/area conserving).
+          ``name`` (str), ``mask`` (bool array; (N_chan, npix, npix), or the half-plane slab shape
+          (N_chan, (npix+1)//2, npix) when ``output_half_plane`` is set), ``freqs`` (seq, len N_chan,
+          in Hz), ``npix`` (int, final uv-grid side), ``pixelscale`` (float, ''/pix on the final
+          grid), ``N_px`` (int, image-cube side for this dataset; must be <= cube_simulator.N_pix),
+          optional ``taper_map`` ((npix, npix), MULTIPLIED before the FFT) and optional
+          ``output_half_plane`` (bool, default False).
+    dish_diameter, line, fwhm_factor, downsample_mode :
+        Same conventions as ``VisibilityCubePadded`` (``line`` in Hz; ``dish_diameter=None``
+        disables the PB; ``downsample_mode`` is the ``F.interpolate`` mode used to degrade the
+        shared cube to a coarser grid; ``'area'`` is flux/area conserving).
     """
 
     def __init__(
@@ -191,10 +232,9 @@ class JointVisibilityCube(Module):
         cube_simulator,
         datasets,
         *,
-        dish_diameter: float = 12.0,
-        line: float = 230.538,
-        deapod_eps_fraction: float = 1e-3,
-        deapod_clamp_max: float = 1e3,
+        dish_diameter=12.0,
+        line: float = 230.538e9,
+        fwhm_factor: float = 1.13,
         downsample_mode: str = "area",
         name: str = "joint_visibility",
     ):
@@ -203,9 +243,9 @@ class JointVisibilityCube(Module):
         self.device = cube_simulator.device
         self.dtype = cube_simulator.dtype
         self.fine_side = int(cube_simulator.N_pix)
-        self.deapod_eps_fraction = float(deapod_eps_fraction)
-        self.deapod_clamp_max = deapod_clamp_max
         self.downsample_mode = downsample_mode
+
+        _check_hz(line, "line")
 
         self._heads = []           # per-dataset precomputed (non-trainable) buffers
         self.fluxes = []           # per-dataset flux Params (registered as children)
@@ -216,6 +256,9 @@ class JointVisibilityCube(Module):
             npix = int(ds["npix"])         # this dataset's final uv-grid side
             pixelscale = float(ds["pixelscale"])
             freqs = ds["freqs"]
+            half_plane = bool(ds.get("output_half_plane", False))
+
+            _check_hz(freqs[0], f"dataset '{nm}': freqs[0]")
 
             if S > self.fine_side:
                 raise ValueError(
@@ -224,52 +267,60 @@ class JointVisibilityCube(Module):
                 )
             if (S % 2) != (npix % 2):
                 raise ValueError(f"dataset '{nm}': parity mismatch S={S} npix={npix}.")
+            if half_plane and npix % 2 != 1:
+                raise ValueError(f"dataset '{nm}': output_half_plane requires odd npix.")
 
-            pb = torch.stack(
-                [gaussian_pb(diameter=dish_diameter, freq=f, shape=(S, S),
-                             deltal=pixelscale, device=self.device, dtype=self.dtype)[0]
-                 for f in freqs],
-                dim=0,
-            )
+            if dish_diameter is None:
+                pb = None
+            else:
+                pb = torch.stack(
+                    [gaussian_pb(diameter=dish_diameter, freq_hz=f, shape=(S, S),
+                                 deltal=pixelscale, fwhm_factor=fwhm_factor,
+                                 device=self.device, dtype=self.dtype)[0]
+                     for f in freqs],
+                    dim=0,
+                )
             _, dv = create_velocity_grid_stable(
                 f_start=freqs[0], f_end=freqs[-1], num_points=len(freqs),
                 target_dtype=self.dtype, device=self.device, line=line,
             )
             pad_tot = npix - S
             pad = (pad_tot // 2, pad_tot - pad_tot // 2) * 2     # (L, R, T, B)
-            mask = torch.as_tensor(ds["mask"], device=self.device, dtype=torch.bool)
 
-            inv_apod = None
-            apo_in = ds.get("apodization_map", None)
-            if apo_in is not None:
-                apo = torch.as_tensor(apo_in, device=self.device, dtype=self.dtype)
-                if apo.shape != (npix, npix):
-                    raise ValueError(f"dataset '{nm}': apodization_map must be ({npix},{npix}).")
-                thresh = self.deapod_eps_fraction * torch.max(torch.abs(apo))
-                inv_apod = torch.where(torch.abs(apo) >= thresh, 1.0 / apo, torch.zeros_like(apo))
-                if self.deapod_clamp_max is not None:
-                    inv_apod = torch.clamp(inv_apod, -float(self.deapod_clamp_max),
-                                           float(self.deapod_clamp_max))
+            mask = torch.as_tensor(ds["mask"], device=self.device, dtype=torch.bool)
+            exp_shape = _expected_mask_shape(len(freqs), npix, half_plane)
+            if tuple(mask.shape) != exp_shape:
+                raise ValueError(
+                    f"dataset '{nm}': mask shape {tuple(mask.shape)} does not match "
+                    f"expected {exp_shape} (output_half_plane={half_plane})."
+                )
+
+            taper = None
+            taper_in = ds.get("taper_map", None)
+            if taper_in is not None:
+                taper = torch.as_tensor(taper_in, device=self.device, dtype=self.dtype)
+                if taper.shape != (npix, npix):
+                    raise ValueError(f"dataset '{nm}': taper_map must be ({npix},{npix}).")
 
             flux = Param(f"flux_{nm}", None)
             setattr(self, f"flux_{nm}", flux)                   # register as a child Param
             self.fluxes.append(flux)
             self._heads.append(dict(name=nm, S=S, npix=npix, pb=pb, dv=dv[0],
-                                    pad=pad, mask=mask, inv_apod=inv_apod))
+                                    pad=pad, mask=mask, taper=taper,
+                                    half_plane=half_plane))
 
     # ------------------------------------------------------------------
     def _visibility_from_cube(self, cube, head, flux):
         """One dataset's cube -> masked UV visibilities (mirrors VisibilityCubePadded)."""
-        cube_pb = cube * head["pb"]
+        if head["pb"] is not None:
+            cube_pb = cube * head["pb"]
+        else:
+            cube_pb = cube
         cube_pb = cube_pb * flux / torch.abs(head["dv"]) / cube_pb.sum()   # Jy km/s total
-        cube_pad = F.pad(cube_pb, head["pad"], mode="constant", value=0.0)
-        if head["inv_apod"] is not None:
-            cube_pad = cube_pad * head["inv_apod"][None, :, :]
-        fft = torch.fft.fftshift(
-            torch.fft.fft2(torch.fft.ifftshift(cube_pad, dim=(-2, -1)), norm="backward"),
-            dim=(-2, -1),
+        return _fft_visibilities(
+            cube_pb, head["pad"], head["taper"], head["mask"],
+            head["half_plane"], head["npix"],
         )
-        return fft * head["mask"].float()
 
     @forward
     def forward(self):

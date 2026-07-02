@@ -6,6 +6,8 @@ import caustics
 from caustics.light import Pixelated
 from torch.nn.functional import avg_pool2d, conv2d
 
+from supermage.simulators.velocity_scatter import scatter_quantiles_along_v
+
 
 class CubeLens(Module):
     def __init__(
@@ -205,30 +207,12 @@ class AnalyticLens(Module):
         Δv = gaussian_quantile_offsets(sigma.abs() + 1e-12, K, device=self.device, dtype=self.dtype)  # (K,1,1) or (K,H,W)
 
         v_sub = v_los.view(1, *v_los.shape) + Δv              # (K,H,W)
-        iv_f  = (v_sub - self.vel0_hi) / self.dv_hi           # (K,H,W)
-        iv0   = torch.floor(iv_f).to(torch.long).clamp(0, self.Nv_hi - 1)
-        iv1   = (iv0 + 1).clamp(0, self.Nv_hi - 1)
-        fv    = (iv_f - iv0.to(iv_f.dtype)).clamp(0, 1)       # (K,H,W)
-
-        # Equal split across quantiles
-        fsub = (I_map / float(K)).view(1, -1)                 # (1, H*W)
-        # Flatten spatial dims once
-        iv0 = iv0.view(K, -1)                                 # (K, H*W)
-        iv1 = iv1.view(K, -1)
-        w0  = (1 - fv).view(K, -1)
-        w1  = fv.view(K, -1)
-
-        # Build flat indices for (v,y,x)
-        baseY = self.Y_flat.expand(K, -1)                     # (K, H*W)
-        baseX = self.X_flat.expand(K, -1)
-        stride_xy = self.hw
-        idx0 = iv0 * stride_xy + baseY * self.N_pix_hi + baseX
-        idx1 = iv1 * stride_xy + baseY * self.N_pix_hi + baseX
-
-        flat = cube_hi.view(-1)
-        flat = flat.scatter_add(0, idx0.reshape(-1), (fsub * w0).reshape(-1))
-        flat = flat.scatter_add(0, idx1.reshape(-1), (fsub * w1).reshape(-1))
-        return flat.view(cube_hi.shape)
+        return scatter_quantiles_along_v(
+            cube_hi, v_sub, I_map,
+            vel0_hi=self.vel0_hi, dv_hi=self.dv_hi, Nv_hi=self.Nv_hi,
+            Y_flat=self.Y_flat, X_flat=self.X_flat,
+            N_pix_hi=self.N_pix_hi, hw=self.hw,
+        )
 
     @forward
     def forward(

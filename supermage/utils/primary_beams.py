@@ -2,10 +2,26 @@ import numpy as np
 import torch
 from astropy import constants as const
 
-def gaussian_pb(diameter=12, freq=432058061289.4426, shape=(500, 500), deltal=0.004, device='cpu', dtype = torch.float64):
+def gaussian_pb(diameter=12, freq_hz=432058061289.4426, shape=(500, 500), deltal=0.004,
+                fwhm_factor=1.13, device='cpu', dtype=torch.float64):
+    """
+    Gaussian primary beam. ``freq_hz`` MUST be in Hz (the parameter was renamed
+    from ``freq`` so stale callers passing GHz break loudly: a GHz value made
+    the wavelength ~1e9x too large and the PB silently flat, pb ≡ 1).
+
+    fwhm_factor : FWHM = fwhm_factor * lambda / D. 1.13 is the ALMA Technical
+    Handbook effective (tapered-illumination) 12-m beam; 1.02 is uniform
+    illumination (the legacy value).
+    """
+    f = float(freq_hz)
+    if not (1e8 < f < 1e13):
+        raise ValueError(
+            f"gaussian_pb expects freq_hz in Hz (1e8 < f < 1e13); got {freq_hz!r}. "
+            "A value of a few hundred suggests GHz — multiply by 1e9."
+        )
     c = const.c.value # Speed of light in m/s
-    wavelength = c / freq
-    fwhm = 1.02 * wavelength / diameter * (180 / torch.pi) * (3600)
+    wavelength = c / f
+    fwhm = fwhm_factor * wavelength / diameter * (180 / torch.pi) * (3600)
     half_fov = deltal * shape[0] / 2
 
     # Grid for PB

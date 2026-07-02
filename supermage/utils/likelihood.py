@@ -32,8 +32,23 @@ __all__ = [
 # Data I/O
 # ──────────────────────────────────────────────────────────────────────────────
 def load_raw_data(data_file, max_freq_index=-1):
-    """Load a gridded interferometric ``.npz`` (VisCube output) into a dict of raw arrays."""
+    """Load a gridded interferometric ``.npz`` (VisCube output) into a dict of raw arrays.
+
+    Supports both conventions:
+      - legacy FULL-plane files (hermitian-redundant grids; every uv cell and its
+        conjugate mirror both stored/fit),
+      - HALF-plane files (``half_plane=True`` in the npz): only the non-redundant
+        Hermitian slab, shape ``(F, (npix+1)//2, npix)``, produced by
+        ``viscube.half_plane_slab`` — this removes the double-counting that
+        understated posterior widths by up to ~2x.
+
+    Half-plane files carry the image-plane ``taper_map`` (the analytic FT of the
+    gridding kernel) which the forward model must MULTIPLY in; it is exposed as
+    ``d["taper_map"]``. The legacy ``apo_map`` key (divide convention) is
+    deliberately NOT read.
+    """
     raw = np.load(data_file)
+    half_plane = bool(raw["half_plane"]) if "half_plane" in raw.files else False
     d = {
         "npix_uv":      int(raw["npix"]),
         "fov_arcsec":   float(raw["fov_arcsec"]),
@@ -44,14 +59,50 @@ def load_raw_data(data_file, max_freq_index=-1):
         "std_bin_imag": raw["std_bin_imag"][:max_freq_index],
         "data_mask":    raw["mask"]        [:max_freq_index],
         "chan_freq_hz": raw["chan_freq_hz"][:max_freq_index],
+        "half_plane":   half_plane,
     }
     assert np.all(np.diff(d["chan_freq_hz"]) > 0), \
         "Channels must be in ascending frequency order"
+
+    d["taper_map"] = (np.asarray(raw["taper_map"], dtype=float)
+                      if "taper_map" in raw.files else None)
+    for meta_key in ("window", "window_m", "window_beta"):
+        if meta_key in raw.files:
+            d[meta_key] = raw[meta_key][()]
+
+    npix = d["npix_uv"]
+    if half_plane:
+        slab_shape = ((npix + 1) // 2, npix)
+        for k in ("vis_bin_re", "vis_bin_imag", "std_bin_re", "std_bin_imag", "data_mask"):
+            if d[k].shape[-2:] != slab_shape:
+                raise ValueError(
+                    f"half_plane npz: {k} last axes {d[k].shape[-2:]} != expected "
+                    f"slab {slab_shape} (npix={npix} is the FULL grid side)."
+                )
+        # Masked cells MUST hold zero data: the DC row's conjugate-duplicate
+        # columns are masked out but were gridded — if their data survived,
+        # (model=0 - data) would add a spurious constant chi^2 offset.
+        off = ~d["data_mask"].astype(bool)
+        if not (np.all(d["vis_bin_re"][off] == 0.0) and np.all(d["vis_bin_imag"][off] == 0.0)):
+            raise ValueError(
+                "half_plane npz: masked cells contain NONZERO visibilities. "
+                "Zero vis (and set std=1) at ~mask before saving "
+                "(see the publication_run_nautilus gridding notebooks)."
+            )
+        if d["taper_map"] is None:
+            raise ValueError("half_plane npz is missing the 'taper_map' key.")
+
     d["freq_ghz_fit"]   = d["chan_freq_hz"] / 1e9
     d["arcsec_per_pix"] = d["fov_arcsec"] / d["npix_uv"]
     d["n_chi"]          = int(np.sum(d["data_mask"]))
-    # data-scale helpers used by some samplers (e.g. PT temperature ladders)
-    n_chi_half          = int(np.sum(raw["mask"]) / 2)   # FULL mask, before channel slicing
+    # data-scale helpers used by some samplers (e.g. PT temperature ladders).
+    # n_chi_half = number of INDEPENDENT complex cells (FULL mask, before channel
+    # slicing): half the mask sum for hermitian-redundant full-plane files, the
+    # mask sum itself for half-plane files.
+    if half_plane:
+        n_chi_half = int(np.sum(raw["mask"]))
+    else:
+        n_chi_half = int(np.sum(raw["mask"]) / 2)
     d["sigma_max"]      = (2.0 * n_chi_half) ** 0.25
     d["sigma_hot"]      = 2.0 * d["sigma_max"]
     return d
