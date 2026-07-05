@@ -7,7 +7,7 @@ nested sampling).
 Precision note (important)
 --------------------------
 The forward model and data tensors are kept in **float32** (memory/speed), but the
-chi^2 **reduction is done in float64**.  At the |logL| magnitudes of real ALMA fits
+chi^2 **reduction is done in float64**.  At the ``|logL|`` magnitudes of real ALMA fits
 (~1e5-1e6) the float32 ULP (~0.016-0.25) quantises distinct parameter points onto
 identical logL values -> plateaus -> degenerate live points -> UltraNest's MLFriends
 whitening goes singular -> ``LinAlgError: Distances are not positive``.  Doing only the
@@ -111,10 +111,15 @@ def load_raw_data(data_file, max_freq_index=-1):
 def build_data_tensors(raw, sigma_broad, device, dtype=torch.float32):
     """Push gridded visibilities to ``device``; return ``(vis_flat, sqrt_Cinv)``.
 
-    ``vis_flat``  : real then imag, flattened, shape ``(2 * N_uv_cells,)``.
-    ``sqrt_Cinv`` : ``1/std`` weights (with ``std`` inflated by ``sigma_broad``); zeros/NaNs
-                    in the std map are replaced by 1 so they contribute finite (down-weighted)
-                    terms.  Multiply a residual by ``sqrt_Cinv`` to get the whitened residual.
+    Returns
+    -------
+    vis_flat : Tensor, shape (2 * N_uv_cells,)
+        Real then imaginary parts, flattened.
+    sqrt_Cinv : Tensor, shape (2 * N_uv_cells,)
+        ``1/std`` weights (with ``std`` inflated by ``sigma_broad``);
+        zeros/NaNs in the std map are replaced by 1 so they contribute
+        finite (down-weighted) terms.  Multiply a residual by ``sqrt_Cinv``
+        to get the whitened residual.
     """
     vis_re_t = torch.tensor(raw["vis_bin_re"],   device=device, dtype=dtype)
     vis_im_t = torch.tensor(raw["vis_bin_imag"], device=device, dtype=dtype)

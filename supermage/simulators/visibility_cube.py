@@ -264,12 +264,13 @@ class VisibilityCubePadded(Module):
 class JointVisibilityCube(Module):
     """Joint, multi-dataset drop-in replacement for ``VisibilityCubePadded``.
 
-    Runs **one** shared ``cube_simulator`` (built at the *finest* dataset's image grid), then for each
-    dataset:
-      1. down-samples the shared cube to that dataset's image grid (flux/area-conserving),
-      2. multiplies by that dataset's primary beam,
-      3. scales to that dataset's own ``flux`` (a separate Param per dataset),
-      4. pads to that dataset's uv-grid, applies that dataset's image-plane taper, FFTs, and masks.
+    Runs **one** shared ``cube_simulator`` (built at the *finest* dataset's
+    image grid), then for each dataset:
+
+    1. down-samples the shared cube to that dataset's image grid (flux/area-conserving),
+    2. multiplies by that dataset's primary beam,
+    3. scales to that dataset's own ``flux`` (a separate Param per dataset),
+    4. pads to that dataset's uv-grid, applies that dataset's image-plane taper, FFTs, and masks.
 
     ``forward()`` returns a list of per-dataset model visibility cubes (same shape/convention as
     ``VisibilityCubePadded.forward()`` would return for each dataset), so it plugs straight into a

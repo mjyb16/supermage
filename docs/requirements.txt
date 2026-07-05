@@ -9,7 +9,7 @@ torch
 viscube
 
 ipywidgets
-jupyter-book
+jupyter-book<2   # 2.x is the Node-based MyST rewrite; this book uses classic 1.x
 matplotlib
 sphinx
 sphinx_rtd_theme
