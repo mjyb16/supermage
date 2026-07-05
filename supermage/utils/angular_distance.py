@@ -1,3 +1,4 @@
+"""Small-angle conversions between angular (arcsec) and physical (pc) sizes."""
 import numpy as np
 from astropy.coordinates import Distance
 from astropy import constants as c

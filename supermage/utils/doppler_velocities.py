@@ -1,3 +1,10 @@
+"""Frequency <-> radio-convention velocity conversion helpers.
+
+The conversion ``v = c * (f_rest - f) / f_rest`` is linear in ``f`` and
+ratio-based, so it is agnostic to the frequency *unit* as long as the
+frequency axis and the rest-frame line frequency use the same one (the
+visibility simulators standardize on Hz).
+"""
 import torch
 from astropy import constants as const
 
@@ -9,17 +16,35 @@ def create_velocity_grid_stable(
     device = "cpu",
     line = 230.538
 ):
-    """
-    Creates a velocity grid using a numerically stable approach.
+    """Create a uniform radio-velocity grid from a uniform frequency axis.
 
-    This method works by recognizing the frequency-to-velocity conversion is a
-    linear transformation (v = A*f + B). It calculates the start velocity and
-    the velocity step size using high-precision float64, then constructs the
-    final grid using the target dtype (e.g., float32). This avoids all
-    cumulative precision errors.
+    Exploits the linearity of the frequency-to-velocity conversion
+    (``v = A*f + B``): the start velocity and the step are computed in
+    float64, then the grid is constructed as ``v0 + i*dv`` directly in the
+    target dtype — avoiding the catastrophic cancellation of converting
+    each (float32) frequency separately.
 
-    Returns:
-        A tuple containing (final velocity grid, velocity steps).
+    Parameters
+    ----------
+    f_start, f_end : float
+        First and last channel frequency (same units as ``line``).
+    num_points : int
+        Number of channels.
+    target_dtype : torch.dtype, optional
+        Dtype of the returned grid (the internal math is float64).
+    device : optional
+        Device of the returned tensors.
+    line : float, optional
+        Rest-frame line frequency, same units as ``f_start``/``f_end``
+        (default 230.538, CO(2-1) in GHz).
+
+    Returns
+    -------
+    abs_velocities : Tensor, shape (num_points,)
+        Absolute radio-convention velocities [km/s] (subtract the systemic
+        velocity for rest-frame values).
+    velocity_steps : Tensor, shape (num_points - 1,)
+        Channel widths [km/s] (negative when frequency increases).
     """
     # --- Step 1: Define grid parameters in HIGH PRECISION (float64) ---
     f_start_64 = torch.tensor(f_start, dtype=torch.float64)
@@ -51,8 +76,24 @@ def create_velocity_grid_stable(
     return abs_velocities.to(device = device), velocity_steps.to(device = device)
 
 def freq_to_vel_absolute(freq, rest_frame_freq, dtype = torch.float64):
-    """
-    Converts frequency (GHz) to absolute velocity (km/s) using the radio convention.
+    """Convert frequency to absolute velocity [km/s], radio convention.
+
+    ``v = c * (f_rest - f) / f_rest``.  ``freq`` and ``rest_frame_freq``
+    must share units (Hz with Hz, or GHz with GHz).
+
+    Parameters
+    ----------
+    freq : Tensor
+        Frequencies to convert.
+    rest_frame_freq : float
+        Rest-frame line frequency (same units as ``freq``).
+    dtype : torch.dtype, optional
+        Precision of the constants (keep float64 for stability).
+
+    Returns
+    -------
+    Tensor
+        Velocities [km/s], same shape as ``freq``.
     """
     # Use high precision for constants 
     c_kms = torch.tensor(const.c.value / 1e3, dtype=dtype, device=freq.device)

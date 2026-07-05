@@ -1,3 +1,10 @@
+"""Visualization and cube post-processing helpers (numpy-side).
+
+Quick-look tools for gridded visibilities and spectral cubes: dirty-image
+cubes, moment-1 (velocity) maps, source masks, cube rotation for
+position-velocity diagrams (PVDs).  These are plotting/diagnostic utilities
+— none of them is differentiable or used inside the forward models.
+"""
 import numpy as np
 import torch
 from scipy import signal
@@ -7,6 +14,24 @@ from scipy.ndimage import rotate
 from typing import Tuple, Union
 
 def dirty_cube_tool(vis_bin_re_cube, vis_bin_imag_cube, roi_start, roi_end):
+    """Inverse-FFT a gridded visibility cube into a dirty-image cube.
+
+    Each channel's complex uv grid is inverse-FFT'd (with the matching
+    ``ifftshift``/``fftshift`` centering) and the real part is cropped to
+    the square region of interest.
+
+    Parameters
+    ----------
+    vis_bin_re_cube, vis_bin_imag_cube : ndarray, shape (F, N, N)
+        Real and imaginary parts of the gridded visibilities.
+    roi_start, roi_end : int
+        Pixel range (both axes) of the image-plane crop.
+
+    Returns
+    -------
+    ndarray, shape (roi, roi, F)
+        The dirty cube, channel axis LAST (matplotlib-friendly).
+    """
     # Define the region of interest for the cube (pixels 1000 to 1050)
     num_frequencies = vis_bin_re_cube.shape[0]  # Total number of frequencies
     
@@ -40,10 +65,31 @@ def weighted_dirty_cube_tool(
     fft_norm="backward",        # unitary FFT keeps noise scaling tidy
     return_snr=False
 ):
-    """
-    Build dirty (and optionally SNR) cube from per-cell *means* by
-    reweighting with a weight grid (Σw or counts), enforcing Hermitian symmetry,
-    and using the real part (no Ricean bias).
+    """Natural-weighted dirty cube from per-cell mean visibilities.
+
+    Gridded data stores per-cell *means*; a naturally weighted dirty image
+    needs the per-cell *sums*.  This recovers them by multiplying with an
+    inverse-variance weight grid built from the per-cell std maps, then
+    inverse-FFTs each channel and takes the real part (no Ricean bias).
+
+    Parameters
+    ----------
+    vis_bin_re_cube, vis_bin_imag_cube : ndarray, shape (F, N, N)
+        Real/imag per-cell mean visibilities.
+    roi_start, roi_end : int
+        Image-plane crop range.
+    std_grid_cube_real, std_grid_cube_imag : ndarray, optional
+        Per-cell std maps; unit weights if omitted.  Cells with ~zero std
+        (empty cells) are effectively zero-weighted.
+    fft_norm : str, optional
+        Norm passed to ``np.fft.ifft2``.
+    return_snr : bool, optional
+        Reserved (currently unused).
+
+    Returns
+    -------
+    ndarray, shape (roi, roi, F)
+        The dirty cube, channel axis last.
     """
     F, Nu, Nv = vis_bin_re_cube.shape
     dirty_cube = []
@@ -76,10 +122,27 @@ def weighted_dirty_cube_tool(
 
 # Eric's mask making code
 def smooth_mask(cube, sigma = 2, hann = 5, clip = 0.0002):  # updated by Eric
-    """
-    Apply a Gaussian blur, using sigma = 4 in the velocity direction (seems to work best), to the uncorrected cube.
-    The mode 'nearest' seems to give the best results.
-    :return: (ndarray) mask to apply to the un-clipped cube
+    """Smooth-and-clip source mask for a spectral cube.
+
+    Spatially box-filters each channel (``uniform_filter`` of size
+    ``sigma``), convolves along the spectral axis with a Hann window of
+    length ``hann``, and thresholds the smoothed cube at ``clip``.
+
+    Parameters
+    ----------
+    cube : ndarray, shape (ny, nx, nchan)
+        Input cube (channel axis last).
+    sigma : int, optional
+        Spatial box-filter size [pixels].
+    hann : int, optional
+        Hann window length [channels].
+    clip : float, optional
+        Threshold applied to the smoothed cube (cube flux units).
+
+    Returns
+    -------
+    ndarray of bool, same shape as ``cube``
+        Mask that is True where the smoothed cube exceeds ``clip``.
     """
     smooth_cube = uniform_filter(cube, size=[sigma, sigma, 0], mode='constant')
     Hann_window=signal.windows.hann(hann)
@@ -100,33 +163,34 @@ def rotate_spectral_cube_center_offset_arcsec(
     pad_cval: Union[int, float] = 0.0,
     interp_order: int = 3,
 ):
-    """
-    Rotate a spectral cube around a point specified as an *arcsecond offset*
-    from the cube’s geometric centre.
+    """Rotate a spectral cube about an off-centre point given in arcsec.
+
+    Pads the cube so the rotation point becomes the geometric centre, then
+    rotates every channel by ``angle_deg``.  Typical use: align the
+    kinematic major axis horizontally before :func:`create_pvd`.
 
     Parameters
     ----------
-    cube : ndarray, shape (ny, nx, nchan)
-        Spectral cube (channel-first).
+    cube_in : ndarray, shape (ny, nx, nchan)
+        Spectral cube (channel axis LAST).
     angle_deg : float
-        Counter-clockwise rotation angle (degrees).
-    center_offset_arcsec : (dx, dy)
-        Offset from the cube centre in arcseconds:
-            dx > 0 → right,  dy > 0 → up.
-        Fractions allowed.
-    pixel_scale : float
-        Arcseconds per pixel (or any unit per pixel),
-        used for the offset conversion *and* to report the new extent.
-    pad_mode / pad_cval / interp_order
-        Passed through to `np.y0.item()pad` and `scipy.ndimage.rotate`.
+        Counter-clockwise rotation angle [deg].
+    center_offset_arcsec : (dx, dy), optional
+        Rotation-point offset from the cube centre [arcsec]; ``dx > 0``
+        right, ``dy > 0`` up.  Fractional values allowed.
+    pixel_scale : float, optional
+        Arcsec per pixel (or any unit per pixel), used for the offset
+        conversion *and* to report the new extent.
+    pad_mode, pad_cval, interp_order : optional
+        Passed through to ``np.pad`` and ``scipy.ndimage.rotate``.
 
     Returns
     -------
-    rotated_cube : ndarray
-        Padded & rotated cube.
-    extent : ((x_min, x_max), (y_min, y_max))
-        Spatial extent in the same physical units as `pixel_scale`.
-        The rotation point is at (0, 0).
+    rotated_cube : ndarray, shape (ny_pad, nx_pad, nchan)
+        Padded and rotated cube (channel axis last).
+    extent : (x_min, x_max, y_min, y_max)
+        Matplotlib-style spatial extent in ``pixel_scale`` units, with the
+        rotation point at (0, 0).
     """
     ny, nx, n_chan = cube_in.shape
 
@@ -206,7 +270,24 @@ def rotate_spectral_cube_center_offset_arcsec(
     
     return np.moveaxis(rotated_cube, 0, -1), extent
 
-def velocity_map(cube, velocities, backend = "numpy"):      
+def velocity_map(cube, velocities, backend = "numpy"):
+    """Intensity-weighted mean velocity (moment-1) map of a cube.
+
+    Parameters
+    ----------
+    cube : ndarray or Tensor, shape (ny, nx, nchan)
+        Spectral cube, channel axis last.
+    velocities : ndarray or Tensor, shape (nchan,)
+        Velocity of each channel [km/s].
+    backend : {"numpy", "pytorch"}, optional
+        Array library of the inputs.
+
+    Returns
+    -------
+    ndarray or Tensor, shape (ny, nx)
+        ``sum(I*v) / sum(I)`` along the channel axis (NaN where the total
+        intensity is zero).
+    """
     # Calculate intensity-weighted average velocity
     if backend == "numpy":
         vel_map = np.sum(cube * velocities[None, None, :], axis=2) / np.sum(cube, axis=2)
@@ -222,7 +303,24 @@ def velocity_map(cube, velocities, backend = "numpy"):
 
 
 def create_pvd(rotated_cube, slice_start, slice_end):
-    """
-    Rotated cube: shape (n_minor_axis, n_major_axis, n_freq)
+    """Position-velocity diagram from a major-axis-aligned cube.
+
+    Sums a slab of rows around the major axis (a pseudo-slit) and
+    reorients the result so position runs horizontally and velocity
+    vertically.  Rotate the cube first with
+    :func:`rotate_spectral_cube_center_offset_arcsec` so the kinematic
+    major axis is horizontal.
+
+    Parameters
+    ----------
+    rotated_cube : ndarray, shape (n_minor_axis, n_major_axis, n_freq)
+        Cube with the major axis along axis 1.
+    slice_start, slice_end : int
+        Row range (minor-axis pixels) of the pseudo-slit to sum.
+
+    Returns
+    -------
+    ndarray, shape (n_freq, n_major_axis)
+        The PVD image.
     """
     return np.flip(np.rot90(rotated_cube[slice_start:slice_end, :, :].sum(axis = 0)))

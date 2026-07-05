@@ -1,3 +1,10 @@
+"""Velocity-axis scatter kernel shared by the analytic renderers.
+
+Deposits per-pixel quantile sub-channels into a position-position-velocity
+cube with linear two-bin weighting, dropping (not folding) out-of-band flux.
+Used by :class:`supermage.simulators.analytic_cube.AnalyticInverse` and
+:class:`supermage.simulators.lensed_cube.AnalyticLens`.
+"""
 import torch
 
 

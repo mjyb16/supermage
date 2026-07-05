@@ -1,3 +1,22 @@
+"""Global optimization by Sobol swarms of local Levenberg-Marquardt runs.
+
+The chi^2 surfaces of kinematic cube fits are multi-modal; these helpers
+combat that by (1) scattering low-discrepancy Sobol points across the prior
+box, (2) optionally pre-selecting the best fraction by a cheap gradient-free
+chi^2 scout pass, and (3) polishing each survivor with a local LM solver
+from :mod:`supermage.solvers.optimizers`.  Variants differ in scouting
+strategy and memory hygiene:
+
+* :func:`sobol_swarm_opt` — no scouting, LM from every Sobol point;
+* :func:`sobol_ga_swarm_opt` — scout ``oversample x n_particles`` points,
+  keep the best ``keep_frac``;
+* :func:`sobol_ga_swarm_no_nan` — same, but drops NaN scouts (invalid
+  parameter regions);
+* :func:`sobol_ga_swarm_efficient` — same as ``no_nan`` plus DataLoader
+  prefetching and aggressive GPU-memory flushing between stages.
+
+All return ``(best_X, best_chi2, best_L, history)``.
+"""
 import math, torch
 from torch.quasirandom import SobolEngine
 from torch.utils.data import DataLoader, TensorDataset
@@ -47,15 +66,41 @@ def sobol_swarm_opt(lm_fn,                    # your lm_direct
                     lm_kwargs  = None,        # extra kwargs to lm_fn
                     verbose    = True,
                     seed       = 42):
-    """
-    Runs `lm_fn` once for each Sobol‑initialised particle.
-    Only one particle lives in memory at any moment.
-    
+    """Run ``lm_fn`` once from each Sobol-initialized particle (serially).
+
+    Only one particle lives in memory at any moment, so GPU memory usage is
+    that of a single LM run.
+
+    Parameters
+    ----------
+    lm_fn : callable
+        Local optimizer with signature ``lm_fn(x0, **lm_kwargs) ->
+        (X_opt, L_opt, chi2_opt)`` (e.g. :func:`~supermage.solvers.optimizers.lm_direct`).
+    param_bounds : sequence of (low, high)
+        Uniform prior box, one pair per parameter.
+    n_particles : int
+        Number of Sobol starting points.
+    dtype, device : optional
+        Placement of the particles.
+    lm_kwargs : dict, optional
+        Extra keyword arguments forwarded to ``lm_fn`` (typically ``Y``,
+        ``f``, ``C``, ``n_chi``...).
+    verbose : bool, optional
+        Print per-particle progress.
+    seed : int, optional
+        NOTE: currently unused — the Sobol draw is hard-seeded to 16 for
+        reproducibility.
+
     Returns
     -------
-    best_X   : Tensor[D]      – parameters of the best run
-    best_val : float or Tensor (scalar) – objective value (e.g. χ²) of the best run
-    history  : list of dicts  – log of every particle
+    best_X : Tensor, shape (D,)
+        Parameters of the best run.
+    best_val : Tensor (scalar)
+        Its chi^2.
+    best_L : float
+        Its final LM damping.
+    history : list of dict
+        ``{idx, X, chi2, L}`` for every particle.
     """
     if lm_kwargs is None:
         lm_kwargs = {}
@@ -95,9 +140,27 @@ def sobol_swarm_opt(lm_fn,                    # your lm_direct
 # 3. Serial (memory‑friendly) Sobol' swarm wrapper
 # ──────────────────────────────────────────────────────────────
 def batch_chi2(points, *, Y, f, Cinv, batch_size=128):
-    """
-    Compute χ² for every point in `points` without building grads.
-    Returns a 1‑D tensor of shape (N,).
+    """Batched, gradient-free chi^2 evaluation of many parameter points.
+
+    Requires a forward model that accepts batched ``(B, D)`` inputs.
+
+    Parameters
+    ----------
+    points : Tensor, shape (N, D)
+        Parameter points to evaluate.
+    Y : Tensor
+        Data (broadcast against the batched forward output).
+    f : callable
+        Batched forward model ``(B, D) -> (B, ...)``.
+    Cinv : Tensor
+        Inverse-variance weights.
+    batch_size : int, optional
+        DataLoader batch size.
+
+    Returns
+    -------
+    Tensor, shape (N,)
+        chi^2 of every point.
     """
     dataset = TensorDataset(points)
     loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -112,9 +175,16 @@ def batch_chi2(points, *, Y, f, Cinv, batch_size=128):
     return torch.cat(chi2_all)                 # (N,)
 
 def iterated_chi2(points, *, Y, f, Cinv):
-    """
-    Compute χ² for every Sobol scout individually (no batching).
-    Suitable when the forward model only accepts (D,) inputs.
+    """Sequential, gradient-free chi^2 evaluation of many parameter points.
+
+    Same contract as :func:`batch_chi2` but calls ``f`` one point at a time,
+    so it works with forward models that only accept ``(D,)`` inputs (the
+    common case for caskade modules).
+
+    Returns
+    -------
+    Tensor, shape (N,)
+        chi^2 of every scout (NaN where the forward model failed).
     """
     chi2_list = []
     with torch.no_grad():

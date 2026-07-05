@@ -1,17 +1,44 @@
+"""Primary-beam models (antenna response across the field of view)."""
 import numpy as np
 import torch
 from astropy import constants as const
 
 def gaussian_pb(diameter=12, freq_hz=432058061289.4426, shape=(500, 500), deltal=0.004,
                 fwhm_factor=1.13, device='cpu', dtype=torch.float64):
-    """
-    Gaussian primary beam. ``freq_hz`` MUST be in Hz (the parameter was renamed
-    from ``freq`` so stale callers passing GHz break loudly: a GHz value made
-    the wavelength ~1e9x too large and the PB silently flat, pb ≡ 1).
+    """Gaussian primary beam on a square image grid, peak-normalized.
 
-    fwhm_factor : FWHM = fwhm_factor * lambda / D. 1.13 is the ALMA Technical
-    Handbook effective (tapered-illumination) 12-m beam; 1.02 is uniform
-    illumination (the legacy value).
+    ``freq_hz`` MUST be in Hz (the parameter was renamed from ``freq`` so
+    stale callers passing GHz break loudly: a GHz value made the wavelength
+    ~1e9x too large and the PB silently flat, pb = 1).
+
+    Parameters
+    ----------
+    diameter : float, optional
+        Antenna diameter [m].
+    freq_hz : float, optional
+        Observing frequency [Hz]; validated to be in ``(1e8, 1e13)``.
+    shape : (int, int), optional
+        Image grid shape (pixels).
+    deltal : float, optional
+        Pixel scale [arcsec / pixel].
+    fwhm_factor : float, optional
+        ``FWHM = fwhm_factor * lambda / D``.  1.13 is the ALMA Technical
+        Handbook effective (tapered-illumination) 12-m beam; 1.02 is uniform
+        illumination (the legacy value).
+    device, dtype : optional
+        Torch placement of the returned beam.
+
+    Returns
+    -------
+    pb : Tensor, shape ``shape``
+        The primary beam, normalized to a peak of 1.
+    fwhm : float
+        The beam FWHM [arcsec].
+
+    Raises
+    ------
+    ValueError
+        If ``freq_hz`` does not look like a Hz value.
     """
     f = float(freq_hz)
     if not (1e8 < f < 1e13):
@@ -40,6 +67,13 @@ def casa_airy_beam(l,m,freq_chan,dish_diameter, blockage_diameter, ipower, max_r
     """
     Airy disk function for the primary beam as implemented by CASA
     Credits: Noé Dia et al.
+
+    .. warning::
+        Legacy/unmaintained: this function currently references a Bessel
+        function ``j1`` that is not imported (and ``casa_twiddle`` calls
+        ``.value`` on a plain float), so it raises if called as-is. Kept for
+        reference; use :func:`gaussian_pb` in the forward models.
+
     Parameters
     ----------
     l: float, radians

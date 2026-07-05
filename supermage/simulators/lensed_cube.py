@@ -1,3 +1,21 @@
+"""Gravitationally lensed spectral-cube simulators (caustics integration).
+
+Two ways to lens a rotating-disk cube through a
+`caustics <https://github.com/Ciela-Institute/caustics>`_ lens model:
+
+* :class:`CubeLens` — lens an *already rendered* source cube channel by
+  channel through a ``Pixelated`` caustics source (interpolation in the
+  source plane).  Works with any source cube simulator.
+* :class:`AnalyticLens` — inverse-mapped analytic renderer: raytrace the
+  image-plane grid to the source plane once, then evaluate the analytic
+  intensity/velocity fields *directly at the raytraced positions*.  No
+  source-plane pixelization, so it preserves the steep central velocity
+  gradients that matter for black-hole work.  Recommended for lensed
+  kinematics.
+
+Both expect image-plane coordinates in arcsec and share the disk-projection
+conventions of :mod:`supermage.simulators.analytic_cube`.
+"""
 import torch
 import math
 from caskade import Module, forward, Param
@@ -10,6 +28,32 @@ from supermage.simulators.velocity_scatter import scatter_quantiles_along_v
 
 
 class CubeLens(Module):
+    """Lens a rendered source cube channel-by-channel through a caustics lens.
+
+    The source cube produced by ``source_cube.forward()`` is wrapped in a
+    caustics ``Pixelated`` source; each channel is raytraced on an
+    oversampled image-plane grid (``vmap`` over channels) and average-pooled
+    down to the requested lens-plane resolution.
+
+    Parameters
+    ----------
+    lens : caustics lens
+        Any lens exposing ``raytrace(thx, thy) -> (bx, by)`` [arcsec].
+    source_cube : Module
+        Cube simulator whose forward returns ``(N_chan, S, S)``.
+    pixelscale_source : float
+        Source-plane pixel scale of the ``Pixelated`` interpolator [arcsec].
+    pixelscale_lens : float
+        Output image-plane pixel scale [arcsec].
+    pixels_x_source : int
+        Source-plane cube side [pixels].
+    pixels_x_lens : int
+        Output image-plane side [pixels].
+    upsample_factor : int
+        Image-plane oversampling before average-pooling.
+    name : str, optional
+        caskade module name.
+    """
     def __init__(
         self,
         lens,
@@ -42,6 +86,20 @@ class CubeLens(Module):
 
     @forward
     def forward(self, lens_source = True):
+        """Render the lensed cube.
+
+        Parameters
+        ----------
+        lens_source : bool, optional
+            If False, skip the deflection and simply resample the source
+            cube on the image-plane grid (useful to compare lensed vs
+            unlensed appearance).
+
+        Returns
+        -------
+        Tensor, shape (N_chan, pixels_x_lens, pixels_x_lens)
+            The lensed (or resampled) cube.
+        """
         cube = self.source_cube.forward()
         bx, by = self.lens.raytrace(self.thx, self.thy)
 
@@ -66,11 +124,26 @@ class CubeLens(Module):
 # ────────────────────────────────────────────────────────────────────────────
 
 def gaussian_quantile_offsets(sigma, K, *, device, dtype):
-    """
-    Deterministic mid-quantile offsets for N(0, sigma^2).
-    Works with scalar or per-pixel sigma:
-      - if sigma is scalar: returns (K,1,1)
-      - if sigma is (H,W): returns (K,H,W)
+    """Deterministic mid-quantile offsets for ``N(0, sigma^2)``.
+
+    Same as
+    :func:`supermage.simulators.analytic_cube.gaussian_quantile_offsets_flex`:
+    splits a Gaussian line profile into ``K`` equal-probability sub-channels
+    via the inverse CDF at mid-quantiles.
+
+    Parameters
+    ----------
+    sigma : Tensor
+        Dispersion [km/s]; scalar or per-pixel ``(H, W)``.
+    K : int
+        Number of quantile sub-channels.
+    device, dtype :
+        Placement of the quantile constants.
+
+    Returns
+    -------
+    Tensor
+        ``(K, 1, 1)`` for scalar ``sigma``, ``(K, H, W)`` for per-pixel.
     """
     p_mid = (torch.arange(K, device=device, dtype=dtype) + 0.5) / K
     unit = math.sqrt(2.0) * torch.erfinv(2.0 * p_mid - 1.0)    # (K,)
@@ -81,14 +154,60 @@ def gaussian_quantile_offsets(sigma, K, *, device, dtype):
         
 
 class AnalyticLens(Module):
-    """
-    Lensing renderer that:
-      - builds an image-plane grid (θx, θy),
-      - raytraces to source plane β(θ),
-      - inverts the sky projection to intrinsic (x_gal, y_gal),
-      - evaluates analytic intensity/velocity fields,
-      - applies deterministic Gaussian-quantile broadening in velocity,
-      - bins into a hi-res (V,H,W) cube and box-filters to low-res.
+    """Inverse-mapped analytic renderer for a lensed rotating disk.
+
+    The lensed analogue of
+    :class:`supermage.simulators.analytic_cube.AnalyticInverse`:
+
+    1. build an oversampled image-plane grid ``(thx, thy)`` [arcsec],
+    2. raytrace through the caustics lens to source-plane ``beta(theta)``,
+    3. subtract source offsets and invert the disk projection to intrinsic
+       ``(x_gal, y_gal)`` [pc],
+    4. evaluate the analytic intensity/velocity fields at those positions,
+    5. spread each image-plane pixel over ``K_vel`` deterministic Gaussian
+       quantile sub-channels, and
+    6. box-filter the hi-res cube down to ``(Nv, N_pix, N_pix)``.
+
+    Because the source is evaluated analytically at the raytraced positions
+    (no ``Pixelated`` interpolation), magnified regions are sampled at full
+    intrinsic resolution.  Pixels raytraced to (numerically) infinite source
+    radius near the lens centre are zeroed rather than allowed to poison the
+    cube with NaNs (see the inline comment in :meth:`forward`).
+
+    caskade Params: ``inclination`` [rad], ``sky_rot`` [rad],
+    ``line_broadening`` [km/s], ``velocity_shift`` [km/s], ``x0``/``y0``
+    [arcsec, source-plane offsets], ``distance_pc`` [pc], plus the lens's
+    and sub-models' Params.
+
+    Parameters
+    ----------
+    lens : caustics lens
+        Lens exposing ``raytrace(thx, thy) -> (bx, by)`` [arcsec].
+    intensity_model : Module
+        Analytic brightness model, ``brightness(R) -> (H, W)``.
+    velocity_model : Module
+        Analytic velocity model, ``velocity(R) -> (H, W)``; its ``inc``
+        Param is pointed at this module's ``inclination``.
+    freq_axis : sequence, shape (Nv,)
+        Uniform frequency axis; same units as ``line``.
+    pixel_scale_arcsec : float
+        Output image-plane pixel scale [arcsec / pixel].
+    N_pix_x : int
+        Output cube side [pixels].
+    K_vel : int, optional
+        Gaussian quantile sub-channels per pixel.
+    oversamp_xy, oversamp_v : int, optional
+        Spatial / velocity oversampling of the internal hi-res grid.
+    chunk_v : int, optional
+        If set, process the hi-res grid in spatial tiles (reduces peak
+        memory; rarely needed).
+    device, dtype :
+        Torch placement.
+    line : float
+        Rest-frame line frequency, in the same units as ``freq_axis``
+        (required; e.g. ``230.538e9`` for CO(2-1) with a Hz axis).
+    name : str, optional
+        caskade module name.
     """
 
     def __init__(
@@ -106,7 +225,7 @@ class AnalyticLens(Module):
         chunk_v: int | None = None,# optional: process velocity axis in chunks of this many hi-res planes
         device: str = "cuda",
         dtype : torch.dtype = torch.float32,
-        line  : 230.538,
+        line  : float,
         name  : str = "analytic_cloudless_lens_inverse",
     ):
         super().__init__(name)
@@ -175,13 +294,21 @@ class AnalyticLens(Module):
 
     # Inverse of your sky-projection (undo rotation + foreshortening)
     def _beta_to_intrinsic(self, beta_x, beta_y, *, x0, y0, pa, cos_i, arcsec_per_pc):
-        """
-        Given βx, βy [arcsec], subtract offsets, convert to pc, and invert:
+        """Source-plane coordinates -> intrinsic disk coordinates.
+
+        Given ``beta_x, beta_y`` [arcsec], subtract offsets, convert to pc,
+        and invert the disk projection::
+
            x_sky =  cos(pa) x_gal - sin(pa) (y_gal cos i)
            y_sky =  sin(pa) x_gal + cos(pa) (y_gal cos i)
-        Inverse:
+           =>
            x_gal =  cos(pa) X + sin(pa) Y
            y_gal = (-sin(pa) X + cos(pa) Y) / cos i
+
+        Returns
+        -------
+        (Tensor, Tensor, Tensor)
+            ``(x_gal, y_gal, R)`` [pc], shaped like the input maps.
         """
         bx = beta_x - x0
         by = beta_y - y0
@@ -196,12 +323,24 @@ class AnalyticLens(Module):
 
     # 1D linear binning along velocity axis for K quantiles per pixel
     def _bin_quantiles_along_v_(self, cube_hi, v_los, I_map, sigma):
-        """
-        cube_hi: (V,H,W) output (pre-zeroed)
-        v_los : (H,W)
-        I_map : (H,W)
-        sigma : scalar or (H,W)
-        Places K_vel equal-flux subchannels at v_los + Δv_k and bins to {iv0, iv1}.
+        """Scatter K equal-flux quantile sub-channels per pixel into ``cube_hi``.
+
+        Parameters
+        ----------
+        cube_hi : Tensor, shape (V, H, W)
+            Pre-zeroed hi-res output cube.
+        v_los : Tensor, shape (H, W)
+            Line-of-sight velocity map [km/s].
+        I_map : Tensor, shape (H, W)
+            Per-pixel intensity (split equally over the K sub-channels).
+        sigma : Tensor
+            Line broadening [km/s]; scalar or per-pixel ``(H, W)``.
+
+        Returns
+        -------
+        Tensor, shape (V, H, W)
+            ``cube_hi`` with the flux deposited (out-of-band flux dropped,
+            see :func:`supermage.simulators.velocity_scatter.scatter_quantiles_along_v`).
         """
         K = self.K_vel
         Δv = gaussian_quantile_offsets(sigma.abs() + 1e-12, K, device=self.device, dtype=self.dtype)  # (K,1,1) or (K,H,W)
@@ -226,11 +365,21 @@ class AnalyticLens(Module):
         distance_pc=None,
         return_intermediates: bool = False,
     ):
-        """
+        """Render the lensed spectral cube (caskade forward).
+
+        Parameters
+        ----------
+        inclination, sky_rot, line_broadening, velocity_shift, x0, y0, distance_pc : optional
+            caskade Params (units in the class docstring).
+        return_intermediates : bool, optional
+            If True, also return ``{"I_map": ..., "v_los": ...}`` on the
+            hi-res image-plane grid.
+
         Returns
         -------
-        cube_lo : Tensor  (Nv_lo, N_pix_lo, N_pix_lo)
-        Optionally returns intermediates (I_map, v_los) if return_intermediates=True.
+        Tensor, shape (Nv_lo, N_pix_lo, N_pix_lo)
+            The lensed cube (relative flux units), or
+            ``(cube, intermediates)`` when ``return_intermediates=True``.
         """
         # Aliases
         cos_i = torch.cos(inclination)
@@ -250,6 +399,18 @@ class AnalyticLens(Module):
         v_circ = self.velocity_model.velocity(R)                  # (H,W)
         cos_theta = x_gal / (R + 1e-12)
         v_los = v_circ * torch.sin(inclination) * cos_theta + velocity_shift
+
+        # Lens-center singularity guard: image-plane pixels within ~a hi-res pixel of
+        # the lens center get a (near-)divergent EPL deflection -> beta overflows in
+        # float32 -> R ~ inf, cos_theta = inf/inf = NaN -> v_los NaN, which would poison
+        # the WHOLE cube through the flux normalization (a single bad voxel rejects an
+        # otherwise-valid sample). Those pixels map to effectively infinite source
+        # radius, so their physical surface brightness is zero: zero both fields there.
+        # A genuinely broken draw (non-finite everywhere) still yields an all-zero cube
+        # -> non-finite flux normalization -> the sampler's invalid-logL sentinel.
+        _bad = ~(torch.isfinite(I_map) & torch.isfinite(v_los))
+        I_map = torch.where(_bad, torch.zeros_like(I_map), I_map)
+        v_los = torch.where(_bad, torch.zeros_like(v_los), v_los)
 
         # Allocate hi-res cube
         cube_hi = torch.zeros(self.Nv_hi, self.N_pix_hi, self.N_pix_hi,

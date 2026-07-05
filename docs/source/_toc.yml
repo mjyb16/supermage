@@ -3,6 +3,22 @@
 
 format: jb-book
 root: intro
-chapters:
-  - file: install
-  - file: notebooks/introductory_example
+parts:
+  - caption: Getting started
+    chapters:
+      - file: install
+      - file: notebooks/01_getting_started
+  - caption: Tutorials
+    chapters:
+      - file: notebooks/02_mass_models
+      - file: notebooks/03_cloud_catalog
+      - file: notebooks/04_visibilities
+      - file: notebooks/05_fitting_mock_data
+      - file: notebooks/06_lensed_cubes
+  - caption: API reference
+    chapters:
+      - file: api/index
+        sections:
+          - file: api/simulators
+          - file: api/solvers
+          - file: api/utils

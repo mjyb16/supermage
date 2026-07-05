@@ -1,3 +1,17 @@
+"""Gradient-based chi^2 optimizers for SuperMAGE forward models.
+
+Levenberg-Marquardt in two flavors — :func:`lm_cg_autograd_stable`
+(matrix-free, Hessian-vector products + conjugate gradient; scales to many
+parameters) and :func:`lm_direct` (explicit ``jacfwd`` Jacobian + dense
+solve; fastest for small parameter counts) — plus a plain Adam loop
+(:func:`adam_optimizer`).  All operate on a flat parameter tensor ``X`` and
+a forward model ``f(X) -> Y_model`` (e.g. a caskade module's ``forward``),
+minimizing ``chi^2 = sum((Y - f(X))^2 * Cinv)``.
+
+The ``C`` argument convention is shared: ``None`` -> unit weights, 1-D ->
+per-datum variances (``Cinv = 1/C``), 2-D -> full covariance (inverted
+once).
+"""
 import torch
 import numpy as np
 from torch.func import jvp, vjp
@@ -5,6 +19,27 @@ from torch.func import jacrev, jacfwd  # (PyTorch ≥2.0; for older versions imp
 from torch.autograd import grad as torch_grad
 
 def cg_solve(hvp, b, x0=None, tol=1e-6, maxiter=20):
+    """Solve ``A x = b`` by conjugate gradient using only matvecs ``hvp``.
+
+    Parameters
+    ----------
+    hvp : callable
+        Symmetric positive-definite matrix-vector product ``v -> A v``
+        (e.g. a damped Gauss-Newton Hessian-vector product).
+    b : Tensor, shape (D,)
+        Right-hand side.
+    x0 : Tensor, optional
+        Initial guess (zeros if None).
+    tol : float, optional
+        Stop when ``||r|| < tol``.
+    maxiter : int, optional
+        Maximum CG iterations.
+
+    Returns
+    -------
+    Tensor, shape (D,)
+        The (approximate) solution.
+    """
     if x0 is None:
         x = torch.zeros_like(b)
     else:
@@ -35,6 +70,51 @@ def lm_cg_autograd_stable(
     stopping=1e-4,
     verbose=True,
 ):
+    """Matrix-free Levenberg-Marquardt (Hessian-vector products + CG).
+
+    Each iteration solves the damped normal equations
+    ``(H + L I) h = -grad`` by conjugate gradient, where ``H v`` is obtained
+    from double-backward autograd — the Jacobian is never materialized, so
+    memory stays flat in the number of data points and parameters.  The
+    damping ``L`` adapts with the gain ratio ``rho`` (down by ``L_dn`` on
+    accepted steps, up by ``L_up`` on rejections).
+
+    Parameters
+    ----------
+    X : Tensor, shape (D,)
+        Initial parameter vector.
+    Y : Tensor
+        Data the model is fit to.
+    f : callable
+        Forward model ``X -> Y_model`` (same shape as ``Y``),
+        autograd-differentiable.
+    n_chi : int
+        Number of data points; only used to report ``chi^2/n`` in the
+        verbose table.
+    C : Tensor, optional
+        Noise: None (unit weights), 1-D variances, or 2-D covariance.
+    epsilon : float, optional
+        Minimum gain ratio ``rho`` to accept a step.
+    L, L_dn, L_up, L_min, L_max : float, optional
+        Initial damping and its adaptation factors/bounds.
+    max_iter : int, optional
+        Maximum LM iterations.
+    cg_maxiter, cg_tol : optional
+        Inner conjugate-gradient budget.
+    stopping : float, optional
+        Terminate when ``||h|| < stopping``.
+    verbose : bool, optional
+        Print a per-iteration table.
+
+    Returns
+    -------
+    X : Tensor, shape (D,)
+        Optimized parameters.
+    L : float
+        Final damping.
+    chi2 : Tensor (scalar)
+        Final chi^2.
+    """
     if C is None:
         Cinv = torch.ones_like(Y)
     elif C.ndim == 1:
@@ -121,16 +201,29 @@ def lm_direct(
     stopping=1e-8,
     verbose=True,
 ):
-    """
-    Dense (direct solve) Levenberg–Marquardt matching lm_cg signature but without CG.
+    """Dense Levenberg-Marquardt with an explicit ``jacfwd`` Jacobian.
 
-    Parameters are identical to lm_cg; cg_maxiter & cg_tol are ignored.
+    Same signature as :func:`lm_cg_autograd_stable` (``cg_maxiter`` and
+    ``cg_tol`` are accepted but ignored).  Each iteration builds the full
+    ``(Dout, Din)`` Jacobian with forward-mode autodiff, forms the
+    Gauss-Newton system ``(J^T W J + L I) h = J^T W dY``, and solves it
+    directly — the fastest and most robust option when the parameter count
+    is small (tens), at the cost of one forward-mode pass per parameter and
+    ``O(Dout * Din)`` memory.
+
+    Parameters
+    ----------
+    See :func:`lm_cg_autograd_stable`; the ``C``/damping/stopping semantics
+    are identical.
 
     Returns
     -------
-    X      : optimised parameter vector
-    L      : final damping value
-    chi2   : final chi^2 (scalar tensor)
+    X : Tensor, shape (D,)
+        Optimized parameters (input is cloned, not modified in place).
+    L : float
+        Final damping value.
+    chi2 : Tensor (scalar)
+        Final chi^2.
     """
 
     # Clone to avoid in-place modification of caller's tensor
@@ -255,6 +348,47 @@ def adam_optimizer(
     n_chi=None,          # ignored for now, kept for compatibility
     verbose=True,
 ):
+    """First-order chi^2 minimization with Adam + cosine-annealed LR.
+
+    A cheap, robust alternative to Levenberg-Marquardt for rough
+    exploration: plain autograd gradient descent on
+    ``chi^2 = sum((Y - f(X))^2 * Cinv)``.  Optionally injects
+    cosine-annealed Gaussian noise (simulated-annealing style) when both
+    ``T_start`` and ``T_end`` are given.  Stops early on NaN.
+
+    Parameters
+    ----------
+    X_init : Tensor, shape (D,)
+        Initial parameters.
+    Y : Tensor
+        Data.
+    f : callable
+        Forward model ``X -> Y_model``.
+    C : Tensor, optional
+        Noise (same convention as the LM solvers).
+    max_iter : int, optional
+        Number of Adam steps.
+    lr : float, optional
+        Adam learning rate (annealed to ``0.1 * lr``).
+    T_start, T_end : float, optional
+        If both set, add noise with std ``sqrt(T) * 1e-4`` where ``T``
+        follows a cosine schedule from ``T_start`` to ``T_end``.
+    n_chi : int, optional
+        Number of data points (verbose display only).
+    verbose : bool, optional
+        Print progress every 10 iterations.  NOTE: the progress line prints
+        ``X[2]`` labelled ``M_bh`` — a historical convention that only
+        makes sense when the third parameter is the black-hole mass.
+
+    Returns
+    -------
+    X : Tensor, shape (D,)
+        Optimized parameters (detached).
+    None
+        Placeholder (keeps the LM return convention ``(X, L, chi2)``).
+    chi2 : Tensor (scalar)
+        Final chi^2.
+    """
     X = X_init.clone().detach().requires_grad_(True)
 
     # Prepare inverse covariance (assume diagonal or full)

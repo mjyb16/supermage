@@ -1,10 +1,35 @@
+"""Gradient-based MCMC sampling (MALA) plus log-probability building blocks.
+
+Provides a batched Metropolis-adjusted Langevin sampler (:func:`mala`, and
+:func:`checkpointed_mala` with disk checkpoint/resume), Gaussian
+log-likelihood and top-hat log-prior helpers, and vmap-accelerated
+log-probability + gradient evaluation.  All samplers run ``C`` independent
+chains in parallel on the GPU; gradients come from autograd through the
+(differentiable) SuperMAGE forward models.
+"""
 import math, torch, numpy as np
 
 def log_like_gaussian(theta, Y_obs, forward_func, Cinv):
-    """
-    theta is a (D,) torch Tensor.
-    The forward model `forward_flat` must return a tensor with same
-    shape & device as Y_obs.
+    """Gaussian log-likelihood ``-0.5 * chi^2`` with a float64 reduction.
+
+    Parameters
+    ----------
+    theta : Tensor, shape (D,)
+        Parameter vector.
+    Y_obs : Tensor
+        Observed data (any shape).
+    forward_func : callable
+        Forward model mapping ``theta`` to a tensor with the same shape and
+        device as ``Y_obs``.
+    Cinv : Tensor
+        Inverse variance weights, broadcastable against ``Y_obs``.
+
+    Returns
+    -------
+    Tensor (scalar, float64)
+        ``-0.5 * sum((Y_obs - f(theta))^2 * Cinv)``.  The residual is
+        upcast to float64 before square+sum to avoid logL quantization
+        plateaus (see inline comment); autograd flows through the cast.
     """
     fY   = forward_func(theta)
     dY   = Y_obs - fY
@@ -15,7 +40,24 @@ def log_like_gaussian(theta, Y_obs, forward_func, Cinv):
     return -0.5 * chi2
 
 def log_prior_tophat(theta, low, high):
-    """Flat prior inside the box, –inf outside (works on a single θ)."""
+    """Flat prior: 0 inside the box ``[low, high]``, ``-inf`` outside.
+
+    Works on a single ``theta``; uses Python control flow, so it is NOT
+    vmappable — use :func:`log_prior_tophat_vmappable` inside
+    ``torch.func.vmap``.
+
+    Parameters
+    ----------
+    theta : Tensor, shape (D,)
+        Parameter vector.
+    low, high : Tensor, shape (D,)
+        Box bounds.
+
+    Returns
+    -------
+    Tensor (scalar)
+        ``0.`` or ``-inf``.
+    """
     device = low.device
     dtype = low.dtype
     in_box = (theta >= low).all() & (theta <= high).all()
@@ -38,6 +80,12 @@ def log_prior_tophat_vmappable(theta, low, high):
     )
 
 def _logp_and_grad_batch(x, log_prob_fn):
+    """Sequential fallback: log-prob and gradient for each chain in a loop.
+
+    One stacked forward builds the graph; a single backward yields all
+    gradients.  ``x`` is ``(C, D)``; returns ``(logps (C,), grads (C, D))``,
+    both detached.
+    """
     # one forward builds graph; one backward gives all grads
     x = x.detach().clone().requires_grad_(True)
     logps = torch.stack([log_prob_fn(xi) for xi in x])      # (C,)
@@ -73,6 +121,45 @@ def mala(
     progress=True,
     use_vmap: bool = True,
 ):
+    """Batched Metropolis-adjusted Langevin (MALA) sampler.
+
+    Runs ``C`` chains in parallel.  Proposals are
+    ``x' = x + 0.5 eps^2 (grad @ Sigma) + eps * L z`` with ``Sigma = L L^T``
+    the (preconditioning) mass matrix; the Metropolis-Hastings correction
+    makes the chain exact.  Gradients are computed for all chains at once
+    with ``torch.func.vmap`` when possible, falling back to a sequential
+    loop on failure.
+
+    Parameters
+    ----------
+    log_prob_fn : callable
+        Maps a single ``(D,)`` parameter tensor to a scalar log-probability
+        (prior + likelihood); must be autograd-differentiable.  Use
+        :func:`log_prior_tophat_vmappable` for box priors when
+        ``use_vmap=True``.
+    init : Tensor, shape (C, D)
+        Initial chain positions.
+    n_steps : int, optional
+        Number of MALA steps.
+    step_size : float, optional
+        Step size ``eps``.
+    mass_matrix : array-like, optional
+        Positive-definite ``(D, D)`` preconditioner ``Sigma`` (posterior
+        covariance estimate works well); identity if None.
+    hastings : bool, optional
+        Apply the MH accept/reject correction (False = unadjusted ULA).
+    progress : bool, optional
+        Show a tqdm progress bar with running acceptance rate and chi^2.
+    use_vmap : bool, optional
+        Try vmap-batched gradients first.
+
+    Returns
+    -------
+    samples : np.ndarray, shape (n_steps, C, D)
+    acc_mask : np.ndarray of bool, shape (n_steps, C)
+    chi2_trace : np.ndarray, shape (n_steps, C)
+        ``-2 * logp`` per chain per step (``inf`` where the prior is violated).
+    """
     x = init.detach().clone()
     dtype, device = x.dtype, x.device
     C, D = x.shape

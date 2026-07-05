@@ -1,3 +1,24 @@
+"""Image-cube -> model-visibility simulators (uv-plane forward models).
+
+Wraps a cube simulator (any Module whose ``forward()`` returns
+``(N_chan, S, S)``) into the interferometric measurement chain:
+primary-beam attenuation -> total-flux normalization -> zero-padding to the
+uv grid -> image-plane taper multiplication -> centered FFT -> (optional
+Hermitian half-plane slab) -> uv mask.  The output matches gridded
+kernel-weighted-mean visibilities produced by ``viscube``.
+
+Conventions (2026-07 corrected pipeline):
+
+* all frequencies (``freqs``, ``line``) are in **Hz** and validated loudly;
+* the image-plane taper (the FT of the gridding kernel) is **multiplied**
+  into the padded image (the legacy divide-by-apodization convention is
+  reproducible explicitly, see :class:`VisibilityCubePadded`);
+* ``output_half_plane=True`` returns only the non-redundant Hermitian half
+  of the uv plane, which avoids double-counting cells in the likelihood.
+
+:class:`JointVisibilityCube` runs one shared source cube through several
+per-dataset measurement chains (multi-configuration / multi-band fits).
+"""
 import torch, math, torch.nn.functional as F
 from caskade import Module, forward, Param
 import numpy as np
@@ -42,6 +63,7 @@ def _fft_visibilities(cube_pb, pad, taper_map, mask, half_plane, npix):
 
 
 def _expected_mask_shape(n_chan, npix, half_plane):
+    """Shape a uv mask must have: full plane or the Hermitian half-plane slab."""
     if half_plane:
         return (n_chan, (npix + 1) // 2, npix)
     return (n_chan, npix, npix)
@@ -65,6 +87,37 @@ class VisibilityCubePadded(Module):
         (N_chan, (npix+1)//2, npix). Requires odd npix and a mask of that
         slab shape (with the DC row's duplicate columns already zeroed, see
         ``viscube.half_plane_mask_fix``).
+
+    caskade Params: ``flux`` — the total integrated line flux [Jy km/s] the
+    cube is normalized to — plus everything owned by ``cube_simulator``.
+
+    Parameters
+    ----------
+    cube_simulator : Module
+        Source cube simulator; ``forward()`` must return
+        ``(N_chan, S, S)`` with ``S = cube_simulator.N_pix`` (same parity as
+        ``npix``, ``S <= npix``).
+    mask : bool array
+        uv cells to keep, shape ``(N_chan, npix, npix)`` — or the half-plane
+        slab shape when ``output_half_plane=True``.
+    freqs : sequence, shape (N_chan,)
+        Channel frequencies [Hz], ascending.
+    npix : int
+        Side of the final (padded) uv grid.
+    pixelscale : float
+        Image pixel scale on the final grid [arcsec / pixel].
+    dish_diameter : float or None, optional
+        Antenna diameter [m] for the Gaussian primary beam; None disables
+        the PB.
+    line : float, optional
+        Rest-frame line frequency [Hz] (default CO(2-1)).
+    image_taper_map : array, optional
+        ``(npix, npix)`` image-plane taper, multiplied before the FFT.
+    fwhm_factor : float, optional
+        PB FWHM = ``fwhm_factor * lambda / D`` (1.13 = ALMA effective).
+    output_half_plane : bool, optional
+        Return only the non-redundant Hermitian slab (requires odd
+        ``npix``).
     """
     def __init__(
         self,
@@ -169,10 +222,23 @@ class VisibilityCubePadded(Module):
     # ---------------------------------------------------------------------
     @forward
     def forward(self, flux=None):
-        """
-        Returns the model visibility cube, masked by self.mask:
-        (N_chan, npix, npix), or (N_chan, (npix+1)//2, npix) when
-        output_half_plane=True.
+        """Simulate the masked model visibility cube (caskade forward).
+
+        Runs the source cube simulator, applies the primary beam, rescales
+        so the integrated line flux equals ``flux`` [Jy km/s], then pads,
+        tapers, FFTs and masks.
+
+        Parameters
+        ----------
+        flux : optional
+            The total-flux Param [Jy km/s]; defaults to 1.0 if the Param is
+            unset.
+
+        Returns
+        -------
+        Tensor (complex)
+            Masked model visibilities: ``(N_chan, npix, npix)``, or
+            ``(N_chan, (npix+1)//2, npix)`` when ``output_half_plane=True``.
         """
         cube_small = self.cube_simulator.forward()          # (N_chan, S, S)
 

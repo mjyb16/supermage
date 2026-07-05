@@ -32,8 +32,9 @@ build:
       - "jupyter-book config sphinx docs/source/"
       # Create font cache ahead of jupyter book
       - 'python -c "import matplotlib.pyplot as plt"'
-      # Get the API documentation dynamically
-      - "sphinx-apidoc -f -o docs/source/ supermage/"
+      # API documentation comes from the static autodoc pages in
+      # docs/source/api/ (sphinx-apidoc is no longer used; it generated
+      # orphan pages outside the book TOC).
 
 python:
   install:
