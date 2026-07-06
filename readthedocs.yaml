@@ -14,19 +14,26 @@ sphinx:
 #    - pdf
 #    - epub
 
-# Optional but recommended, declare the Python requirements required
-# to build your documentation
-# See https://docs.readthedocs.io/en/stable/guides/reproducible-builds.html
-# Specify dependencies to be installed
-# Define the system dependencies
 build:
-  os: "ubuntu-20.04"
+  # ubuntu-20.04 was removed by Read the Docs on 2026-06-01; builds pinned to
+  # it fail at config validation.
+  os: "ubuntu-24.04"
   tools:
-    python: "3.10"
+    python: "3.12"
   apt_packages:
     - pandoc # Specify pandoc to be installed via apt-get
     - graphviz # Specify graphviz to be installed via apt-get
   jobs:
+    post_checkout:
+      # RTD clones shallow (depth 50) WITHOUT tags; setuptools_scm needs the
+      # tag history to derive the package version during `pip install .`.
+      - git fetch --unshallow || true
+      - git fetch --tags || true
+    pre_install:
+      # Install CPU-only torch first: the default PyPI wheel drags in
+      # multi-gigabyte NVIDIA CUDA libraries that exceed RTD's disk/time
+      # budget. The later `-r requirements.txt` sees torch already satisfied.
+      - pip install torch --index-url https://download.pytorch.org/whl/cpu
     pre_build:
       # Generate the Sphinx configuration for this Jupyter Book so it builds.
       - "jupyter-book config sphinx docs/source/"
