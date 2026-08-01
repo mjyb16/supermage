@@ -299,8 +299,8 @@ class MGEVelocityIntr(Module):
         Gravitational constant; the default ``0.004301``
         [pc (km/s)^2 / M_sun] yields velocities in km/s for radii in pc.
     """
-    def __init__(self, N_components: int, device, dtype, quad_points=128, radius_res = 4096, variable_M_to_L = False, soft = 0.0, G=0.004301):
-        super().__init__("MGEVelocityIntr")
+    def __init__(self, N_components: int, device, dtype, quad_points=128, radius_res = 4096, variable_M_to_L = False, soft = 0.0, G=0.004301, name: str = "MGEVelocityIntr"):
+        super().__init__(name)
         self.device = device
         self.dtype  = dtype
         
@@ -469,7 +469,95 @@ class MGEVelocityIntr(Module):
         return v_abs
 
 
-                
+class MGEVelocity(MGEVelocityIntr):
+    """Circular velocity of an MGE mass model parameterized by **observed** axial ratios.
+
+    Identical physics to :class:`MGEVelocityIntr`, but the caskade Param is
+    the *observed* (projected) axial ratio ``qobs`` of each Gaussian instead
+    of the intrinsic one.  The oblate deprojection
+
+    .. math::
+
+        q_\\mathrm{intr} = \\frac{\\sqrt{q_\\mathrm{obs}^2 - \\cos^2 i}}{\\sin i}
+
+    is folded into the model as a caskade *pointer* Param, so it is
+    re-evaluated on every forward with the **live** inclination.
+
+    Parameters (caskade ``Param``\\ s, supplied at call time)
+    --------------------------------------------------------
+    Same as :class:`MGEVelocityIntr` except ``qintr`` is replaced by
+
+    qobs : (N_components,)
+        Observed axial ratio of each Gaussian (from the photometric MGE fit).
+        For a fixed measured MGE, make it static with ``.to_static(...)``;
+        ``inc`` may remain dynamic and the deprojection follows it.
+
+    Validity domain and differentiability
+    -------------------------------------
+    * The deprojection is real only for ``qobs > cos(inc)`` for **every**
+      Gaussian, i.e. ``inc > arccos(min(qobs))``.  No clamping or masking is
+      applied (the math is kept exact): outside the domain the forward value
+      is NaN, and callers (priors / likelihood wrappers) are responsible for
+      restricting ``inc`` to the valid range.
+    * Everywhere strictly inside the domain the model is differentiable
+      w.r.t. all Params (``qobs``, ``inc``, ``surf``, ``sigma``, ``M_to_L``,
+      ``m_bh``) under both reverse- and forward-mode AD (vmap/jacfwd safe,
+      same as the parent class).
+    * The gradients w.r.t. ``qobs`` and ``inc`` scale as
+      ``1 / sqrt(qobs^2 - cos^2(inc))`` and therefore **blow up as the
+      boundary is approached**; exactly at ``qobs = cos(inc)`` they are
+      Inf/NaN.  
+    * The difference of squares is evaluated as
+      ``(qobs - cos i) * (qobs + cos i)`` — algebraically identical to
+      ``qobs**2 - cos(inc)**2`` but with less cancellation error near the
+      boundary.
+    * The parent kernel (:meth:`MGEVelocityIntr.radial_velocity`) internally
+      reconstructs ``qobs = sqrt(qintr^2 sin^2 i + cos^2 i)`` for the
+      surface-density normalization.  With ``qintr`` supplied by the
+      deprojection pointer this round trip is the exact algebraic identity
+      (it returns the original ``qobs``, and its contributions to
+      ``d/d inc`` cancel exactly), so the math and its gradients are
+      unchanged; only at the boundary itself does the round trip turn an
+      otherwise finite partial derivative into NaN — irrelevant in practice
+      because the mass normalization ``1/qintr`` already diverges there.
+
+    See :class:`MGEVelocityIntr` for the constructor arguments.
+    """
+    def __init__(self, N_components: int, device, dtype, quad_points=128, radius_res = 4096, variable_M_to_L = False, soft = 0.0, G=0.004301):
+        super().__init__(
+            N_components,
+            device,
+            dtype,
+            quad_points=quad_points,
+            radius_res=radius_res,
+            variable_M_to_L=variable_M_to_L,
+            soft=soft,
+            G=G,
+            name="MGEVelocity",
+        )
+
+        self.qobs = Param("qobs", shape=(N_components,))
+
+        # qintr becomes a functional pointer: deprojected from (qobs, inc) at
+        # call time, inside the active caskade forward (so vmap/AD trace it).
+        self.qintr = self._qintr_from_qobs
+        self.qintr.link([self.qobs, self.inc])
+
+    def _qintr_from_qobs(self, p):
+        """Oblate deprojection ``qintr = sqrt(qobs^2 - cos^2 inc) / sin(inc)``.
+
+        Evaluated lazily by caskade whenever ``qintr`` is dereferenced.
+        Real (and differentiable) only for ``qobs > cos(inc)``; see the class
+        docstring for the boundary behavior.
+        """
+        qobs = p.qobs.value
+        inc = p.inc.value
+        cos_i = torch.cos(inc)
+        sin_i = torch.sin(inc)
+        return torch.sqrt((qobs - cos_i) * (qobs + cos_i)) / sin_i
+
+
+
 # -----------------------------
 # Helper: precomputed ridge projector for MGE coefficients
 # -----------------------------
