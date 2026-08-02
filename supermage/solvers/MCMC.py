@@ -2,10 +2,12 @@
 
 Provides a batched Metropolis-adjusted Langevin sampler (:func:`mala`, and
 :func:`checkpointed_mala` with disk checkpoint/resume), Gaussian
-log-likelihood and top-hat log-prior helpers, and vmap-accelerated
-log-probability + gradient evaluation.  All samplers run ``C`` independent
-chains in parallel on the GPU; gradients come from autograd through the
-(differentiable) SuperMAGE forward models.
+log-likelihood and top-hat log-prior helpers (including
+:func:`log_like_gaussian_flux_marginal`, the likelihood with a pixelated
+flux distribution analytically marginalized under a Gaussian prior), and
+vmap-accelerated log-probability + gradient evaluation.  All samplers run
+``C`` independent chains in parallel on the GPU; gradients come from
+autograd through the (differentiable) SuperMAGE forward models.
 """
 import math, torch, numpy as np
 
@@ -38,6 +40,194 @@ def log_like_gaussian(theta, Y_obs, forward_func, Cinv):
     # Upcasting the residual before square+sum removes this at negligible cost (autograd-safe).
     chi2 = (dY.double().square() * Cinv.double()).sum()
     return -0.5 * chi2
+
+def _flux_marginal_terms(theta, Y_obs, forward_func, Cinv,
+                         flux_response, flux_prior_std, gram=None, jitter=0.0):
+    """Shared pieces of the flux-marginalized Gaussian likelihood.
+
+    Computes, for the linear-flux model ``y = f(theta) + A(theta) @ delta_f``
+    with noise ``N(0, Cinv^-1)`` and flux-deviation prior
+    ``delta_f ~ N(0, diag(s)^2)``:
+
+    * ``chi2_base`` : the ordinary whitened ``chi^2`` of the prior-mean model
+      (float64 reduction, same convention as :func:`log_like_gaussian`);
+    * ``b = S A^T Cinv r`` : the prior-scaled whitened adjoint of the
+      residual (shape ``(K,)``, float64);
+    * ``L`` : Cholesky factor of ``M = I_K + S A^T Cinv A S`` (float64);
+    * ``s`` : the resolved per-pixel prior std (shape ``(K,)``, float64).
+
+    The two data-sized contractions (``A^T Cinv r`` and, when ``gram`` is not
+    supplied, ``A^T Cinv A``) run in ``A``'s dtype (typically float32, like
+    every SuperMAGE forward); all K-sized quantities are float64.
+    """
+    fY = forward_func(theta)
+    r = (Y_obs - fY).reshape(-1)
+    cinv = torch.broadcast_to(Cinv, Y_obs.shape).reshape(-1)
+    chi2_base = (r.double().square() * cinv.double()).sum()
+
+    A = flux_response(theta) if callable(flux_response) else flux_response
+    if A.ndim != 2 or A.shape[0] != r.numel():
+        raise ValueError(
+            f"flux_response must be (N_data, K) with N_data == Y_obs.numel() "
+            f"= {r.numel()}; got {tuple(A.shape)}")
+    K = A.shape[1]
+
+    s = flux_prior_std(theta) if callable(flux_prior_std) else flux_prior_std
+    s = torch.as_tensor(s, device=r.device).to(torch.float64).reshape(-1)
+    if s.numel() == 1:
+        s = s.expand(K)
+    elif s.numel() != K:
+        raise ValueError(
+            f"flux_prior_std must be a scalar or length-{K}; got {s.numel()}")
+
+    v = (cinv * r).to(A.dtype)
+    b = s * (A.mT @ v).double()
+
+    if gram is None:
+        gram = (A * cinv.to(A.dtype).unsqueeze(-1)).mT @ A
+    M = s.unsqueeze(-1) * gram.double() * s.unsqueeze(-2)
+    M = M + (1.0 + jitter) * torch.eye(K, dtype=torch.float64, device=r.device)
+    L = torch.linalg.cholesky(M)
+    return chi2_base, b, L, s
+
+
+def log_like_gaussian_flux_marginal(theta, Y_obs, forward_func, Cinv,
+                                    flux_response, flux_prior_std,
+                                    gram=None, jitter=0.0):
+    """Gaussian log-likelihood with a pixelated flux map marginalized out.
+
+    Model: the data are Gaussian around a forward model that is **linear** in
+    a per-pixel flux deviation ``delta_f`` (K pixels) about the parametric
+    flux distribution rendered by ``forward_func`` itself,
+
+    .. math::
+
+        y = f(\\theta) + A(\\theta)\\,\\delta f + n,\\qquad
+        n \\sim N(0, C_n),\\ C_n^{-1} = \\mathrm{diag(Cinv)},
+
+    with the Gaussian prior ``delta_f ~ N(0, diag(s)^2)``.  Because the prior
+    is centered on the *rendered parametric* flux map (e.g. the exponential
+    disk at the current ``theta``) rather than on zero, the prior-mean model
+    is exactly the standard SuperMAGE forward and this likelihood reduces to
+    :func:`log_like_gaussian` as ``s -> 0``.
+
+    Marginalizing ``delta_f`` analytically (Woodbury + matrix determinant
+    lemma, all dense algebra in the K-dimensional pixel space) gives
+
+    .. math::
+
+        \\log L(\\theta) = -\\tfrac12\\left(\\tilde r^T \\tilde r
+            - b^T M^{-1} b\\right) - \\tfrac12 \\log\\det M + \\mathrm{const},
+
+    with the whitened residual ``r_t = sqrt(Cinv) * (Y_obs - f(theta))``,
+    ``B = sqrt(Cinv)[:,None] * A * s[None,:]``, ``b = B^T r_t`` and
+    ``M = I_K + B^T B``.  Relative to the ordinary likelihood this adds a
+    flux-refit credit ``+ b^T M^{-1} b / 2`` (how much a Gaussian-regularized
+    pixel refit could improve chi^2) and the Occam penalty
+    ``- log det M / 2`` that prices the extra freedom — both fully
+    ``theta``-dependent, so the marginal is a proper likelihood for MCMC /
+    nested sampling over the kinematic parameters.  The dropped constant
+    (``-N/2 log 2pi - 1/2 log det C_n``) is independent of ``theta`` *and* of
+    ``s``, so ``flux_prior_std`` may itself be a sampled hyperparameter.
+
+    Parameters
+    ----------
+    theta : Tensor, shape (D,)
+        Parameter vector.
+    Y_obs : Tensor
+        Observed data (any shape; complex data should be pre-stacked as
+        real/imag, as in the pipeline ``fwd_single`` convention).
+    forward_func : callable
+        ``theta -> model`` with the prior-mean flux distribution folded
+        in (the standard production forward: its parametric flux map IS the
+        prior center).
+    Cinv : Tensor
+        Inverse variance, broadcastable against ``Y_obs``.
+    flux_response : Tensor or callable
+        ``(N_data, K)`` linear response of the *flattened, unwhitened* model
+        to per-pixel flux deviations, columns ``d model / d f_i`` — the dense
+        form of the Task-3 ``FluxOperator`` map with the total-flux
+        normalization frozen at the current ``theta`` (freezing the
+        normalization is what makes the map linear; the total-flux degree of
+        freedom then lives in ``delta_f`` and is regularized by the prior).
+        Pass a callable ``theta -> A`` for a ``theta``-dependent operator, or
+        a fixed tensor for the frozen-kinematics approximation.
+    flux_prior_std : float, Tensor (K,), or callable
+        Prior std of each pixel's flux deviation.  A useful choice is a
+        fractional width ``alpha * f_exp.flatten()``: with ``alpha`` modest
+        (<~ 0.3) most prior mass stays positive, which is the practical
+        substitute for the non-negativity constraint of the projected-CG
+        solve — **positivity itself cannot be kept in closed form** (a
+        truncated-Gaussian marginal has no analytic integral); this is the
+        one ingredient of the pixelated analysis this likelihood gives up.
+    gram : Tensor (K, K), optional
+        Precomputed ``A^T diag(Cinv) A`` (unwhitened-by-prior).  When ``A``
+        and ``Cinv`` are fixed this removes the O(N_data * K^2) cost per
+        call, leaving O(N_data * K + K^3).
+    jitter : float, optional
+        Relative diagonal jitter added to the unit diagonal of ``M`` for
+        Cholesky robustness.
+
+    Returns
+    -------
+    Tensor (scalar, float64)
+        The marginal log-likelihood up to the ``theta``-independent constant
+        (same convention as :func:`log_like_gaussian`).  Differentiable
+        w.r.t. ``theta`` (through ``forward_func``, a callable
+        ``flux_response`` and a callable ``flux_prior_std``) and vmappable,
+        so it drops into :func:`mala` unchanged.
+
+    Notes
+    -----
+    Cost per evaluation: one forward, one ``(K, N_data)`` matvec, plus
+    ``O(N_data * K^2)`` for the Gram matrix when ``gram`` is not supplied and
+    ``O(K^3)`` for the Cholesky — practical for K up to a few thousand
+    (e.g. the 69x69 low-res model grid, K = 4761), not for K ~ 3e5
+    (549x549); at that scale a matrix-free treatment would be needed.
+    """
+    chi2_base, b, L, _ = _flux_marginal_terms(
+        theta, Y_obs, forward_func, Cinv, flux_response, flux_prior_std,
+        gram=gram, jitter=jitter)
+    u = torch.cholesky_solve(b.unsqueeze(-1), L).squeeze(-1)
+    quad = (b * u).sum()
+    logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum()
+    return -0.5 * (chi2_base - quad) - 0.5 * logdet
+
+
+def flux_marginal_posterior(theta, Y_obs, forward_func, Cinv,
+                            flux_response, flux_prior_std,
+                            gram=None, jitter=0.0):
+    """Conditional posterior of the flux deviation at fixed ``theta``.
+
+    For the same linear-Gaussian model as
+    :func:`log_like_gaussian_flux_marginal`, the flux deviation posterior is
+    Gaussian in closed form:
+
+    .. math::
+
+        \\delta f \\mid d, \\theta \\sim N\\left(S M^{-1} b,\\;
+        S M^{-1} S\\right)
+
+    (``S = diag(s)``).  The full flux map is ``f_exp(theta) + delta_f`` —
+    useful as the Bayesian analogue of the Task-3 ``f_opt`` diagnostic (this
+    mean is the Gaussian-prior ridge solution rather than the
+    non-negativity-projected CG solution).
+
+    Returns
+    -------
+    (Tensor, Tensor)
+        ``delta_f_mean`` of shape ``(K,)`` and posterior covariance of shape
+        ``(K, K)``, both float64.
+    """
+    _, b, L, s = _flux_marginal_terms(
+        theta, Y_obs, forward_func, Cinv, flux_response, flux_prior_std,
+        gram=gram, jitter=jitter)
+    u = torch.cholesky_solve(b.unsqueeze(-1), L).squeeze(-1)
+    delta_f_mean = s * u
+    Minv = torch.cholesky_inverse(L)
+    cov = s.unsqueeze(-1) * Minv * s.unsqueeze(-2)
+    return delta_f_mean, cov
+
 
 def log_prior_tophat(theta, low, high):
     """Flat prior: 0 inside the box ``[low, high]``, ``-inf`` outside.
